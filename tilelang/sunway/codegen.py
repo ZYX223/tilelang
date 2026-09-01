@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from tvm import IRModule, tirx
 from tvm.target import Target
 
+from .runtime.manifest import SunwayKernelArgument, SunwayKernelManifest
 from .target import get_sunway_target_config
 
 
@@ -297,6 +298,32 @@ def _emit_mpe(kernel: _Kernel) -> str:
     )
 
 
+def _emit_manifest(kernel: _Kernel, output_indices: tuple[int, ...]) -> SunwayKernelManifest:
+    invalid = [index for index in output_indices if index < 0 or index >= len(kernel.parameters)]
+    if invalid:
+        raise ValueError(f"Sunway output parameter indices are out of range: {invalid}")
+    outputs = frozenset(output_indices)
+    arguments = tuple(
+        SunwayKernelArgument(
+            name=_c_identifier(buffer.name),
+            dtype=str(buffer.dtype),
+            shape=tuple(int(dim) for dim in buffer.shape),
+            role="output" if index in outputs else "input",
+        )
+        for index, buffer in enumerate(kernel.parameters)
+    )
+    return SunwayKernelManifest(
+        kernel_name=kernel.name,
+        symbol=kernel.name,
+        arguments=arguments,
+        artifacts={
+            "header": f"{kernel.name}_common.h",
+            "mpe": f"mpe_{kernel.name}.c",
+            "cpe": f"cpe_{kernel.name}.c",
+        },
+    )
+
+
 def build_without_compile(mod: IRModule, target: Target):
     """Emit an AOT project and return its CPE source as a TVM source module."""
 
@@ -314,6 +341,7 @@ def build_without_compile(mod: IRModule, target: Target):
             f"cpe_{kernel.name}.c": cpe,
         }.items():
             (config.output_dir / filename).write_text(content, encoding="utf-8")
+        _emit_manifest(kernel, config.output_indices).write(config.output_dir / "manifest.json")
 
     import tvm.runtime._ffi_api as runtime_ffi
 

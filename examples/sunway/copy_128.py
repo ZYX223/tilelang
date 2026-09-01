@@ -21,7 +21,7 @@ def main() -> None:
 
     artifact = tilelang.lower(
         copy_128,
-        target={"kind": "sunway", "output_dir": str(args.output_dir)},
+        target={"kind": "sunway", "output_dir": str(args.output_dir), "output_indices": [1]},
         runtime_only=True,
     )
     print(f"generated {args.output_dir} ({len(artifact.kernel_source)} CPE C bytes)")

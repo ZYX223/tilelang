@@ -28,6 +28,7 @@ class SunwayTargetConfig:
     dma_alignment: int = 16
     simd_width: int = 8
     output_dir: Path | None = None
+    output_indices: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, object]) -> SunwayTargetConfig:
@@ -41,6 +42,7 @@ class SunwayTargetConfig:
             dma_alignment=int(values.get("dma_alignment", defaults.dma_alignment)),
             simd_width=int(values.get("simd_width", defaults.simd_width)),
             output_dir=Path(str(output_dir)).expanduser() if output_dir is not None else None,
+            output_indices=tuple(int(index) for index in values.get("output_indices", defaults.output_indices)),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -52,6 +54,7 @@ class SunwayTargetConfig:
             "dma_alignment": self.dma_alignment,
             "simd_width": self.simd_width,
             "output_dir": str(self.output_dir) if self.output_dir is not None else None,
+            "output_indices": list(self.output_indices),
         }
 
 
