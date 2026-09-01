@@ -489,6 +489,14 @@ option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel r
 # Include tvm after configs have been populated
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 
+# GCC 8 keeps std::filesystem in a separate compatibility library. Link the
+# TVM compiler target explicitly while leaving newer toolchains unchanged.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9
+   AND TARGET tvm_compiler)
+  target_link_libraries(tvm_compiler PRIVATE stdc++fs)
+endif()
+
 # Strip the hardcoded /Zi PRIVATE option that tvm-ffi attaches in its
 # tvm_ffi_add_msvc_flags() helper. It overrides our Embedded debug info
 # format and forces a side-channel vc140.pdb that races under parallel

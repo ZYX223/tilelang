@@ -1025,6 +1025,17 @@ def get_type_hints(func):
         if value is None:
             value = type(None)
         if isinstance(value, str):
+            # DSL annotations such as ``T.Tensor(...)`` evaluate to TileLang
+            # buffer descriptors rather than Python ``type`` objects.  Resolve
+            # them directly before handing ordinary forward references to
+            # typing._eval_type, which rejects non-type descriptors.
+            try:
+                evaluated = eval(value, globalns, localns)
+            except (NameError, SyntaxError):
+                evaluated = None
+            if evaluated is not None and not isinstance(evaluated, str):
+                hints[name] = evaluated
+                continue
             # if the annotation is string, is can be: (i) a T.float32 like annotations, (ii) a ForwardRef object
             # typing doesn't handle (i), it will try to interpret T.float32
             #    typing see: T.float32 is str('float32'), and there is no object named `flaot32` and give a NameError

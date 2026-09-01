@@ -7,10 +7,18 @@ from tilelang.backend.module import BackendModule, register_backend
 
 from . import codegen, execution_backend, pipeline
 
+
+def _is_plain_cpu_target(target) -> bool:
+    """Keep carrier targets such as Sunway out of the generic CPU backend."""
+
+    return "sunway" not in target.keys
+
+
 BACKEND = register_backend(
     BackendModule(
         name="cpu",
         target_kinds=("c", "llvm"),
+        supports_target=_is_plain_cpu_target,
         pipelines={
             "c": PassPipeline("c", pipeline.CPUPassPipelineBody),
             "llvm": PassPipeline("llvm", pipeline.CPUPassPipelineBody),

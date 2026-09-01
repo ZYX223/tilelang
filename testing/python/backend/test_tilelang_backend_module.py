@@ -16,6 +16,7 @@ def test_builtin_backend_modules_are_explicit():
         "cpu": (("c", "llvm"), ["cython", "tvm_ffi"]),
         "metal": (("metal",), ["torch", "tvm_ffi"]),
         "webgpu": (("webgpu",), ["tvm_ffi"]),
+        "sunway": (("c",), ["sunway_aot"]),
     }
 
     assert {
