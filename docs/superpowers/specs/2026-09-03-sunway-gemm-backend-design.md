@@ -35,27 +35,89 @@ an unsuitable large-M GEMM schedule.
 
 ## User Contract
 
-The public operation remains TileLang's existing synchronous interface:
+The primary frontend is the same tiled TileLang program shape used by existing
+backends. Sunway does not introduce a separate `SW.gemm` operation or redefine
+`T.gemm` as a whole-matrix library call:
 
 ```python
-@T.prim_func
-def gemm(
-    A: T.Tensor((M, K), "float32"),
-    B: T.Tensor((K, N), "float32"),
-    C: T.Tensor((M, N), "float32"),
-):
-    T.gemm(A, B, C, clear_accum=True)
+@tilelang.jit(out_idx=[-1])
+def matmul(M, N, K, block_M, block_N, block_K, num_workers, num_stages):
+    @T.prim_func
+    def gemm(
+        A: T.Tensor((M, K), "float32"),
+        B: T.Tensor((K, N), "float32"),
+        C: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, block_N),
+            T.ceildiv(M, block_M),
+            threads=num_workers,
+        ) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), "float32")
+            B_shared = T.alloc_shared((block_K, block_N), "float32")
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
+
+            T.clear(C_local)
+            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(B[ko * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return gemm
 ```
 
-Users do not write CPE ids, LDM allocations, DMA reply counters, SIMD builtin
-names, or ping-pong buffer management. Schedule overrides and tuning records
-are backend configuration, not new frontend operations.
+The language-level compatibility contract covers `T.Kernel`, `T.alloc_shared`,
+`T.alloc_fragment`, `T.clear`, `T.Pipelined`, `T.copy`, `T.gemm`, and the normal
+buffer-region syntax. Existing target-independent parameters and annotations
+retain their meanings. Sunway-specific schedule choices remain backend config
+or tuner output rather than new frontend operations.
 
-The Paper-1 whole-tensor entrypoint may omit `T.Kernel`. Before generic
-`LowerTileOp`, the Sunway pipeline materializes one logical worker domain whose
-extent is `cpe_rows * cpe_cols`. This is an internal compatibility device for
-TileLang layout/lowering; it does not introduce CUDA thread semantics into the
-public Sunway API. The logical worker id lowers to the CPE id in S3.
+Interface compatibility does not mean that one schedule configuration is legal
+on every target. CUDA thread counts, warp policies, shared-memory capacities,
+and pipeline depths are target constraints. For the first single-CG Sunway
+implementation, `num_workers` must equal `cpe_rows * cpe_cols`, and
+`num_stages` must be one or two. Cross-backend examples should parameterize
+these values while retaining the same TileLang source structure.
+
+The Sunway meanings of the official scopes are:
+
+- `T.Kernel` describes the logical output-tile grid and worker domain. The tile
+  grid becomes CPE-owned outer loops, and the logical worker id becomes the CPE
+  id; it does not create CUDA blocks or threads in generated code.
+- `T.alloc_shared` describes a cooperatively visible tile. Because CPE LDM is
+  physically private, layout inference realizes the logical tile through legal
+  per-CPE distribution, replication, DMA, and later row/column communication.
+- `T.alloc_fragment` describes each worker's accumulator fragment and lowers to
+  registers or private LDM according to the selected microkernel.
+- `T.Pipelined` expresses overlap intent. The Sunway schedule chooses concrete
+  LDM stage buffers and DMA reply dependencies.
+
+The initial GEMM verifier supports the cooperative access patterns produced by
+the canonical tiled program above. It rejects arbitrary cross-worker shared
+access when the backend cannot preserve its semantics. Users still do not write
+CPE ids, DMA reply counters, SWGCC SIMD builtin names, or ping-pong pointers.
+
+A future whole-matrix convenience template may generate this official tiled
+program, but the bare `T.gemm(A_global, B_global, C_global)` shorthand is not a
+Paper-1 frontend contract.
+
+## Cross-Backend Compatibility Requirements
+
+Sunway compilation must preserve the existing language surface and reject
+unsupported schedules explicitly. In particular:
+
+- no public Sunway-only GEMM, copy, pipeline, allocation, or synchronization
+  function is required for the MVP;
+- the generic `GemmWarpPolicy` argument remains accepted as a partition hint;
+  its square/full-row/full-column choices map to logical CPE mesh ownership;
+- common TileLang analysis and `LowerTileOp` dispatch remain in the path;
+- target-specific behavior begins at implementation selection, layout
+  realization, schedule legality, and semantic lowering;
+- a program that compiles for multiple targets has the same mathematical and
+  memory-dependence semantics, even though its physical storage, worker mapping,
+  and emitted instructions differ.
 
 ## Integration With TileLang GEMM Dispatch
 
@@ -89,7 +151,8 @@ S1 retains `tl.tileop.gemm` and its semantic information:
 - M, N, and K;
 - input, accumulator, and output dtypes;
 - transpose flags and `clear_accum`;
-- the logical single-CG worker domain.
+- the `T.Kernel` tile grid and logical worker domain;
+- shared and fragment scopes, pipeline loops, and copy dependencies.
 
 No LDM layout, DMA ABI call, SIMD builtin, or fixed schedule is present.
 
@@ -295,6 +358,9 @@ acceptance.
 
 ### G0: Dispatch And Scalar Correctness
 
+- the canonical tiled frontend parses without any Sunway-only language call;
+- `T.Kernel`, shared/fragment allocations, copies, pipeline structure, and
+  `T.gemm` remain visible at their documented stage boundaries;
 - `T.gemm` resolves through generic GEMM dispatch to `sunway.scalar`.
 - S1/S2/S3 dumps preserve the documented boundary.
 - square and non-square FP32 shapes match a host reference within a declared
@@ -333,9 +399,13 @@ acceptance.
 
 ## Risks And Controls
 
-- **Generic LowerTileOp assumes SIMT concepts.** Materialize a logical worker
-  domain internally and test every surviving binding; do not expose CUDA names
-  in the user API or generated C.
+- **Generic LowerTileOp contains SIMT-oriented assumptions.** Preserve the
+  official `T.Kernel` interface, normalize its logical worker domain to the CPE
+  mesh, and test every surviving binding; do not emit CUDA concepts in C.
+- **Logical shared storage is not physically shared CPE memory.** Limit the MVP
+  to verified cooperative GEMM access patterns and realize them through
+  distribution or replication. Reject unsupported sharing rather than silently
+  treating private LDM as globally visible.
 - **Toolchain SIMD names may differ by Sunway generation.** Probe installed
   headers and compile minimal examples before locking the S3 intrinsic mapping.
 - **Double buffering may not overlap as expected.** Keep one-stage and
@@ -350,8 +420,8 @@ acceptance.
 ## Implementation Sequence
 
 1. Register the Sunway C++ GEMM target implementation and Python scalar class.
-2. Materialize the logical CPE worker domain and route `T.gemm` through
-   `LowerTileOp`.
+2. Normalize the official `T.Kernel` worker domain to one CPE mesh and route
+   `T.gemm` through `LowerTileOp`.
 3. Add scalar S2/S3 verification and pass a real FP32 GEMM.
 4. Add `SunwayGemmPlan`, multi-K tile materialization, and tail policies.
 5. Probe SWGCC SIMD support and add the verified VMAD microkernel.
