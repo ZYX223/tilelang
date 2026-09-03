@@ -122,6 +122,13 @@ class _CPEEmitter:
         self.buffer_bases: dict[tirx.Var, str] = {buffer.data: f"ldm_args.{_c_identifier(buffer.name)}" for buffer in kernel.parameters}
         for buffer in kernel.locals:
             self.buffer_bases[buffer.data] = _c_identifier(buffer.name)
+        self.bound_values: dict[tirx.Var, tirx.PrimExpr] = {}
+
+        def collect_bind(node: object) -> None:
+            if isinstance(node, tirx.Bind):
+                self.bound_values[node.var] = node.value
+
+        tirx.stmt_functor.post_order_visit(kernel.func.body, collect_bind)
 
     def line(self, text: str = "") -> None:
         self.lines.append(f"{'    ' * self.indent}{text}" if text else "")
@@ -141,12 +148,6 @@ class _CPEEmitter:
         self.line()
         self.line(f"void {self.kernel.cpe_entry}({self.kernel.args_type} *global_args) {{")
         self.indent += 1
-        bound_vars = self._bound_vars()
-        for var in bound_vars:
-            self.line(f"{_c_type(var.dtype)} {_c_identifier(var.name)};")
-        if bound_vars:
-            self.line()
-
         # Every CPE first copies the small launch descriptor into its own LDM.
         # This is the backend ABI prologue; kernel statements start after it.
         self.line("reply = 0;")
@@ -159,16 +160,6 @@ class _CPEEmitter:
         self.line("}")
         return "\n".join(self.lines) + "\n"
 
-    def _bound_vars(self) -> tuple[tirx.Var, ...]:
-        variables: list[tirx.Var] = []
-
-        def visit(node: object) -> None:
-            if isinstance(node, tirx.Bind):
-                variables.append(node.var)
-
-        tirx.stmt_functor.post_order_visit(self.kernel.func.body, visit)
-        return tuple(variables)
-
     def emit_stmt(self, stmt: object) -> None:
         if isinstance(stmt, tirx.SeqStmt):
             for child in stmt.seq:
@@ -176,13 +167,27 @@ class _CPEEmitter:
             return
         if isinstance(stmt, tirx.AllocBuffer):
             return
+        if isinstance(stmt, tirx.DeclBuffer):
+            # LowerOpaqueBlock may retain a shaped alias over an allocated data
+            # variable. The backing C array is emitted from AllocBuffer once.
+            return
+        if isinstance(stmt, tirx.AttrStmt):
+            if str(stmt.attr_key) != "lexical_alloc_scope":
+                raise TypeError(f"Sunway CPE codegen does not support attribute {stmt.attr_key!r}")
+            self.emit_stmt(stmt.body)
+            return
         if isinstance(stmt, tirx.Bind):
-            self.line(f"{_c_identifier(stmt.var.name)} = {self.emit_expr(stmt.value)};")
             return
         if isinstance(stmt, tirx.BufferStore):
             base = self._buffer_base(stmt.buffer)
-            indices = [self.emit_expr(index) for index in stmt.indices]
-            target = base if base == "reply" and indices == ["0"] else f"{base}[{']['.join(indices)}]"
+            offset = self._emit_flat_index(stmt.buffer, list(stmt.indices))
+            scalar_reply = (
+                base == "reply"
+                and len(stmt.indices) == 1
+                and isinstance(stmt.indices[0], tirx.IntImm)
+                and int(stmt.indices[0]) == 0
+            )
+            target = base if scalar_reply else f"{base}[{offset}]"
             self.line(f"{target} = {self.emit_expr(stmt.value)};")
             return
         if isinstance(stmt, tirx.For):
@@ -248,7 +253,14 @@ class _CPEEmitter:
         if isinstance(expr, tirx.FloatImm):
             return repr(float(expr))
         if isinstance(expr, tirx.Var):
+            for var, value in self.bound_values.items():
+                if var.same_as(expr):
+                    return self.emit_expr(value)
             return _c_identifier(expr.name)
+        if isinstance(expr, tirx.BufferLoad):
+            base = self._buffer_base(expr.buffer)
+            offset = self._emit_flat_index(expr.buffer, list(expr.indices))
+            return base if base == "reply" and offset == "0" else f"{base}[{offset}]"
         if isinstance(expr, tirx.Cast):
             return f"(({_c_type(expr.dtype)})({self.emit_expr(expr.value)}))"
         if isinstance(expr, tirx.Min):
@@ -277,6 +289,19 @@ class _CPEEmitter:
         if base == "reply" and offset == "0":
             return "&reply"
         return base if offset == "0" else f"({base} + {offset})"
+
+    def _emit_flat_index(self, buffer: tirx.Buffer, indices: list[object]) -> str:
+        if len(indices) != len(buffer.shape):
+            raise TypeError("Sunway CPE codegen buffer rank mismatch")
+        for dim in buffer.shape:
+            if not isinstance(dim, tirx.IntImm):
+                raise TypeError("Sunway CPE codegen requires static buffer shapes")
+        if not indices:
+            return "0"
+        offset = f"({self.emit_expr(indices[0])})"
+        for index, dim in zip(indices[1:], buffer.shape[1:], strict=True):
+            offset = f"(({offset}) * {int(dim)} + ({self.emit_expr(index)}))"
+        return offset
 
     def _emit_access_ptr(self, call: tirx.Call) -> str:
         data = call.args[1]
