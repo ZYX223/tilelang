@@ -43,6 +43,11 @@ _BINARY_OPERATORS = {
     tirx.Or: "||",
 }
 
+_BINARY_INTRINSICS = {
+    "tirx.bitwise_and": "&",
+    "tirx.shift_right": ">>",
+}
+
 
 def _c_identifier(value: object) -> str:
     identifier = re.sub(r"[^A-Za-z0-9_]", "_", str(value))
@@ -274,9 +279,13 @@ class _CPEEmitter:
             name = _extern_name(expr)
             if name == "_MYID":
                 return "_MYID"
-            if getattr(expr.op, "name", None) == "tirx.tvm_access_ptr":
+            op_name = getattr(expr.op, "name", None)
+            if op_name in _BINARY_INTRINSICS and len(expr.args) == 2:
+                operator = _BINARY_INTRINSICS[op_name]
+                return f"({self.emit_expr(expr.args[0])} {operator} {self.emit_expr(expr.args[1])})"
+            if op_name == "tirx.tvm_access_ptr":
                 return self._emit_access_ptr(expr)
-            if getattr(expr.op, "name", None) == "tirx.address_of":
+            if op_name == "tirx.address_of":
                 return self._emit_address_of(expr)
         raise TypeError(f"Sunway CPE codegen does not support expression {type(expr).__name__}")
 

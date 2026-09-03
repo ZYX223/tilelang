@@ -85,13 +85,19 @@ def _rewrite_for(
     )
 
 
-def lower_sunway_kernel_bindings(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
-    """Serialize block tiles and map the logical worker binding to the CPE id."""
+def lower_sunway_kernel_bindings(
+    mod: IRModule,
+    config: SunwayTargetConfig,
+    plan: SunwayGemmPlan,
+) -> IRModule:
+    """Map logical TileLang workers and tiles to the selected CPE schedule."""
 
     expected_workers = config.cpe_rows * config.cpe_cols
 
     def rewrite_func(func: tirx.PrimFunc) -> tirx.PrimFunc:
         pe_id = tirx.Var("pe_id", "int32")
+        pe_row = tirx.Var("pe_row", "int32")
+        pe_col = tirx.Var("pe_col", "int32")
         thread_x_sites = 0
 
         def rewrite(node: object) -> object | None:
@@ -100,6 +106,32 @@ def lower_sunway_kernel_bindings(mod: IRModule, config: SunwayTargetConfig) -> I
                 return None
             tag = str(node.thread_binding.thread_tag)
             if tag in {"blockIdx.x", "blockIdx.y"}:
+                if plan.ownership == "mesh_2d":
+                    coordinate = pe_col if tag == "blockIdx.x" else pe_row
+                    stride = config.cpe_cols if tag == "blockIdx.x" else config.cpe_rows
+                    dimension = "bx" if tag == "blockIdx.x" else "by"
+                    tile_extent = _static_int(node.extent, f"{tag} extent")
+                    rounds = (tile_extent + stride - 1) // stride
+                    round_var = tirx.Var(f"{dimension}_round", "int32")
+                    tile_coordinate = coordinate + round_var * stride
+                    tile_body = tirx.stmt_functor.substitute(
+                        node.body,
+                        {node.loop_var: tile_coordinate},
+                    )
+                    guarded_body = tirx.IfThenElse(
+                        tile_coordinate < tile_extent,
+                        tile_body,
+                        None,
+                        span=getattr(node, "span", None),
+                    )
+                    return tirx.For(
+                        round_var,
+                        0,
+                        rounds,
+                        tirx.ForKind.SERIAL,
+                        guarded_body,
+                        span=getattr(node, "span", None),
+                    )
                 return _rewrite_for(node, node.body, kind=tirx.ForKind.SERIAL)
             if tag == "blockIdx.z":
                 if _static_int(node.extent, tag) != 1:
@@ -111,6 +143,8 @@ def lower_sunway_kernel_bindings(mod: IRModule, config: SunwayTargetConfig) -> I
                     raise ValueError(f"Sunway G0 requires {expected_workers} logical workers, got {workers}")
                 thread_x_sites += 1
                 worker_body = tirx.stmt_functor.substitute(node.body, {node.loop_var: pe_id})
+                if plan.ownership == "mesh_2d":
+                    return worker_body
                 # TileOp layout lowering may fold its own guard to true; S2 owns
                 # the target-visible single-CPE ownership decision explicitly.
                 return tirx.IfThenElse(pe_id == 0, worker_body, None, span=getattr(node, "span", None))
@@ -123,12 +157,17 @@ def lower_sunway_kernel_bindings(mod: IRModule, config: SunwayTargetConfig) -> I
         body = tirx.stmt_functor.ir_transform(func.body, None, rewrite)
         if thread_x_sites != 1:
             raise ValueError(f"Sunway G0 requires one threadIdx.x binding, found {thread_x_sites}")
-        body = tirx.SeqStmt(
-            [
-                tirx.Bind(pe_id, tirx.call_extern("int32", "tilelang_sunway_pe_id")),
-                body,
-            ]
-        )
+        bindings: list[tirx.Stmt] = [
+            tirx.Bind(pe_id, tirx.call_extern("int32", "tilelang_sunway_pe_id")),
+        ]
+        if plan.ownership == "mesh_2d":
+            bindings.extend(
+                [
+                    tirx.Bind(pe_row, tirx.FloorDiv(pe_id, config.cpe_cols)),
+                    tirx.Bind(pe_col, tirx.FloorMod(pe_id, config.cpe_cols)),
+                ]
+            )
+        body = tirx.SeqStmt([*bindings, body])
         return func.with_body(body)
 
     return _map_prim_funcs(mod, rewrite_func)
@@ -264,12 +303,14 @@ def _bound_block_tile_extents(func: tirx.PrimFunc) -> tuple[int, int]:
     return extents["blockIdx.y"], extents["blockIdx.x"]
 
 
-def _restore_unit_block_dimensions(
+def _restore_serial_dimensions(
     mod: IRModule,
-    block_tiles_m: int,
-    block_tiles_n: int,
+    y_name: str,
+    y_extent: int,
+    x_name: str,
+    x_extent: int,
 ) -> IRModule:
-    """Keep the explicit two-dimensional tile grid after opaque-block cleanup."""
+    """Keep explicit schedule dimensions after extent-one loop cleanup."""
 
     def rewrite(func: tirx.PrimFunc) -> tirx.PrimFunc:
         loop_names: set[str] = set()
@@ -278,15 +319,15 @@ def _restore_unit_block_dimensions(
             lambda node: loop_names.add(node.loop_var.name) if isinstance(node, tirx.For) else None,
         )
         body = func.body
-        missing_x = "bx" not in loop_names
-        missing_y = "by" not in loop_names
+        missing_x = x_name not in loop_names
+        missing_y = y_name not in loop_names
         if missing_x and missing_y:
             if not isinstance(body, tirx.SeqStmt) or not body.seq:
                 raise ValueError("Sunway G0 cannot restore unit block dimensions around the S2 payload")
             statements = list(body.seq)
             payload = statements[-1]
-            payload = tirx.For(tirx.Var("by", "int32"), 0, block_tiles_m, tirx.ForKind.SERIAL, payload)
-            payload = tirx.For(tirx.Var("bx", "int32"), 0, block_tiles_n, tirx.ForKind.SERIAL, payload)
+            payload = tirx.For(tirx.Var(y_name, "int32"), 0, y_extent, tirx.ForKind.SERIAL, payload)
+            payload = tirx.For(tirx.Var(x_name, "int32"), 0, x_extent, tirx.ForKind.SERIAL, payload)
             statements[-1] = payload
             body = tirx.SeqStmt(statements)
         elif missing_x:
@@ -294,12 +335,12 @@ def _restore_unit_block_dimensions(
 
             def insert_x(node: object) -> object | None:
                 nonlocal inserted
-                if inserted or not isinstance(node, tirx.For) or node.loop_var.name != "by":
+                if inserted or not isinstance(node, tirx.For) or node.loop_var.name != y_name:
                     return None
                 inserted = True
                 # LowerOpaqueBlock legally removes extent-one loops. Restore
                 # bx immediately around by, below function-level resources.
-                return tirx.For(tirx.Var("bx", "int32"), 0, block_tiles_n, tirx.ForKind.SERIAL, node)
+                return tirx.For(tirx.Var(x_name, "int32"), 0, x_extent, tirx.ForKind.SERIAL, node)
 
             body = tirx.stmt_functor.ir_transform(body, None, insert_x)
             if not inserted:
@@ -309,10 +350,10 @@ def _restore_unit_block_dimensions(
 
             def insert_y(node: object) -> object | None:
                 nonlocal inserted
-                if inserted or not isinstance(node, tirx.For) or node.loop_var.name != "bx":
+                if inserted or not isinstance(node, tirx.For) or node.loop_var.name != x_name:
                     return None
                 inserted = True
-                inner = tirx.For(tirx.Var("by", "int32"), 0, block_tiles_m, tirx.ForKind.SERIAL, node.body)
+                inner = tirx.For(tirx.Var(y_name, "int32"), 0, y_extent, tirx.ForKind.SERIAL, node.body)
                 return _rewrite_for(node, inner, kind=tirx.ForKind.SERIAL)
 
             body = tirx.stmt_functor.ir_transform(body, None, insert_y)
@@ -323,6 +364,20 @@ def _restore_unit_block_dimensions(
     return _map_prim_funcs(mod, rewrite)
 
 
+def _restore_unit_block_dimensions(
+    mod: IRModule,
+    block_tiles_m: int,
+    block_tiles_n: int,
+) -> IRModule:
+    return _restore_serial_dimensions(mod, "by", block_tiles_m, "bx", block_tiles_n)
+
+
+def _restore_mesh_round_dimensions(mod: IRModule, plan: SunwayGemmPlan) -> IRModule:
+    rounds_m = (plan.block_tiles_m + plan.cpe_rows - 1) // plan.cpe_rows
+    rounds_n = (plan.block_tiles_n + plan.cpe_cols - 1) // plan.cpe_cols
+    return _restore_serial_dimensions(mod, "by_round", rounds_m, "bx_round", rounds_n)
+
+
 def attach_scalar_gemm_plan(
     mod: IRModule,
     plan: SunwayGemmPlan,
@@ -331,19 +386,31 @@ def attach_scalar_gemm_plan(
     """Attach the S2 contract consumed by verification, codegen, and manifests."""
 
     def rewrite(func: tirx.PrimFunc) -> tirx.PrimFunc:
-        block_tiles_m, block_tiles_n = _block_tile_extents(func)
-        if (block_tiles_m, block_tiles_n) != expected_block_tiles:
-            raise ValueError("Sunway G0 block tile loops changed during S2 lowering")
+        if plan.ownership == "single":
+            block_tiles_m, block_tiles_n = _block_tile_extents(func)
+            if (block_tiles_m, block_tiles_n) != expected_block_tiles:
+                raise ValueError("Sunway G0 block tile loops changed during S2 lowering")
+        else:
+            block_tiles_m, block_tiles_n = expected_block_tiles
         attrs = {
             "sunway.phase": "S2",
             "sunway.kernel_kind": "gemm_scalar",
             "sunway.cpe_count": plan.workers,
-            "sunway.active_cpes": 1,
+            "sunway.active_cpes": plan.active_cpes,
+            "sunway.cpe_rows": plan.cpe_rows,
+            "sunway.cpe_cols": plan.cpe_cols,
+            "sunway.ownership": plan.ownership,
+            "sunway.compute": plan.compute,
             "sunway.block_tiles_m": block_tiles_m,
             "sunway.block_tiles_n": block_tiles_n,
+            "sunway.k_panels": plan.k_panels,
+            "sunway.global_m": plan.global_m,
+            "sunway.global_n": plan.global_n,
+            "sunway.global_k": plan.global_k,
             "sunway.tile_m": plan.tile_m,
             "sunway.tile_n": plan.tile_n,
             "sunway.tile_k": plan.tile_k,
+            "sunway.vector_width": plan.vector_width,
             "sunway.pipeline_stages": plan.stages,
             "sunway.ldm_bytes": plan.ldm_bytes,
         }
@@ -362,12 +429,15 @@ def lower_gemm_program_to_semantic_tir(mod: IRModule, config: SunwayTargetConfig
     block_tiles = _bound_block_tile_extents(source_func)
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
-    mod = lower_sunway_kernel_bindings(mod, config)
+    mod = lower_sunway_kernel_bindings(mod, config, plan)
     mod = expand_sunway_dma_2d(mod, config, plan)
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tirx.transform.Simplify()(mod)
-    mod = _restore_unit_block_dimensions(mod, *block_tiles)
+    if plan.ownership == "mesh_2d":
+        mod = _restore_mesh_round_dimensions(mod, plan)
+    else:
+        mod = _restore_unit_block_dimensions(mod, *block_tiles)
     return attach_scalar_gemm_plan(mod, plan, block_tiles)
 
 
@@ -378,6 +448,39 @@ def _is_worker_zero(condition: tirx.PrimExpr) -> bool:
     has_zero = any(isinstance(value, tirx.IntImm) and int(value) == 0 for value in operands)
     has_pe_id = any(isinstance(value, tirx.Var) and value.name == "pe_id" for value in operands)
     return has_zero and has_pe_id
+
+
+def _uses_var(node: object, name: str) -> bool:
+    found = False
+
+    def visit(candidate: object) -> None:
+        nonlocal found
+        if isinstance(candidate, tirx.Var) and candidate.name == name:
+            found = True
+
+    tirx.stmt_functor.post_order_visit(node, visit)
+    return found
+
+
+def _contains_node_type(node: object, node_type: type) -> bool:
+    found = False
+
+    def visit(candidate: object) -> None:
+        nonlocal found
+        if isinstance(candidate, node_type):
+            found = True
+
+    tirx.stmt_functor.post_order_visit(node, visit)
+    return found
+
+
+def _mesh_owner_count(block_tiles_m: int, block_tiles_n: int, rows: int, cols: int) -> int:
+    owners = {
+        (by % rows) * cols + (bx % cols)
+        for by in range(block_tiles_m)
+        for bx in range(block_tiles_n)
+    }
+    return len(owners)
 
 
 def _required_positive_attr(func: tirx.PrimFunc, key: str) -> int:
@@ -401,20 +504,40 @@ def _verify_gemm_semantic_func(func: tirx.PrimFunc, config: SunwayTargetConfig) 
         for key in (
             "sunway.cpe_count",
             "sunway.active_cpes",
+            "sunway.cpe_rows",
+            "sunway.cpe_cols",
             "sunway.block_tiles_m",
             "sunway.block_tiles_n",
+            "sunway.k_panels",
             "sunway.tile_m",
             "sunway.tile_n",
             "sunway.tile_k",
+            "sunway.vector_width",
             "sunway.pipeline_stages",
             "sunway.ldm_bytes",
         )
     }
+    ownership = str(func.attrs.get("sunway.ownership", ""))
+    compute = str(func.attrs.get("sunway.compute", ""))
+    if ownership not in {"single", "mesh_2d"}:
+        raise ValueError(f"Sunway S2 GEMM invariant failed: unsupported ownership {ownership!r}")
+    if compute not in {"scalar", "simd"}:
+        raise ValueError(f"Sunway S2 GEMM invariant failed: unsupported compute mode {compute!r}")
     expected_workers = config.cpe_rows * config.cpe_cols
     if metadata["sunway.cpe_count"] != expected_workers:
         raise ValueError("Sunway S2 GEMM invariant failed: CPE count does not match the target mesh")
-    if metadata["sunway.active_cpes"] != 1:
-        raise ValueError("Sunway S2 GEMM invariant failed: G0 must activate exactly one CPE")
+    if metadata["sunway.cpe_rows"] != config.cpe_rows or metadata["sunway.cpe_cols"] != config.cpe_cols:
+        raise ValueError("Sunway S2 GEMM invariant failed: CPE mesh metadata is inconsistent")
+    expected_active_cpes = 1
+    if ownership == "mesh_2d":
+        expected_active_cpes = _mesh_owner_count(
+            metadata["sunway.block_tiles_m"],
+            metadata["sunway.block_tiles_n"],
+            config.cpe_rows,
+            config.cpe_cols,
+        )
+    if metadata["sunway.active_cpes"] != expected_active_cpes:
+        raise ValueError("Sunway S2 GEMM invariant failed: active CPE metadata is inconsistent")
     if metadata["sunway.pipeline_stages"] != 1:
         raise ValueError("Sunway S2 GEMM invariant failed: G0 requires one pipeline stage")
     if metadata["sunway.ldm_bytes"] > config.ldm_bytes_per_cpe:
@@ -458,23 +581,86 @@ def _verify_gemm_semantic_func(func: tirx.PrimFunc, config: SunwayTargetConfig) 
     tirx.stmt_functor.post_order_visit(func.body, visit)
     if any(loop.thread_binding is not None for loop in loops):
         raise ValueError("Sunway S2 GEMM invariant failed: thread binding remains after ownership lowering")
-    block_loops = {loop.loop_var.name: loop for loop in loops if loop.loop_var.name in {"bx", "by"}}
-    if set(block_loops) != {"bx", "by"} or any(
-        loop.kind != tirx.ForKind.SERIAL for loop in block_loops.values()
-    ):
-        raise ValueError("Sunway S2 GEMM invariant failed: block tiles must be static serial bx/by loops")
-    if int(block_loops["by"].extent) != metadata["sunway.block_tiles_m"] or int(
-        block_loops["bx"].extent
-    ) != metadata["sunway.block_tiles_n"]:
-        raise ValueError("Sunway S2 GEMM invariant failed: block tile loop metadata is inconsistent")
-    if len(binds) != 1 or binds[0].var.name != "pe_id":
-        raise ValueError("Sunway S2 GEMM invariant failed: expected one semantic PE id binding")
+    bind_map = {bind.var.name: bind for bind in binds}
+    if ownership == "single":
+        block_loops = {loop.loop_var.name: loop for loop in loops if loop.loop_var.name in {"bx", "by"}}
+        if set(block_loops) != {"bx", "by"} or any(
+            loop.kind != tirx.ForKind.SERIAL for loop in block_loops.values()
+        ):
+            raise ValueError("Sunway S2 GEMM invariant failed: block tiles must be static serial bx/by loops")
+        if int(block_loops["by"].extent) != metadata["sunway.block_tiles_m"] or int(
+            block_loops["bx"].extent
+        ) != metadata["sunway.block_tiles_n"]:
+            raise ValueError("Sunway S2 GEMM invariant failed: block tile loop metadata is inconsistent")
+        if set(bind_map) != {"pe_id"}:
+            raise ValueError("Sunway S2 GEMM invariant failed: expected one semantic PE id binding")
 
-    owned_names = [name for owner in owners for name in _named_calls(owner.then_case)]
-    if Counter(owned_names)["tilelang_sunway_dma_get"] != 2 or Counter(owned_names)[
-        "tilelang_sunway_dma_put"
-    ] != 1:
-        raise ValueError("Sunway S2 GEMM invariant failed: every DMA site must be owned by CPE zero")
+        owned_names = [name for owner in owners for name in _named_calls(owner.then_case)]
+        if Counter(owned_names)["tilelang_sunway_dma_get"] != 2 or Counter(owned_names)[
+            "tilelang_sunway_dma_put"
+        ] != 1:
+            raise ValueError("Sunway S2 GEMM invariant failed: every DMA site must be owned by CPE zero")
+    else:
+        if owners:
+            raise ValueError("Sunway S2 GEMM invariant failed: mesh ownership retained a CPE-zero guard")
+        if set(bind_map) != {"pe_id", "pe_row", "pe_col"}:
+            raise ValueError("Sunway S2 GEMM invariant failed: mesh coordinate bindings are incomplete")
+        if _call_name(bind_map["pe_id"].value) != "tilelang_sunway_pe_id":
+            raise ValueError("Sunway S2 GEMM invariant failed: PE id binding is not semantic")
+        row_value = bind_map["pe_row"].value
+        col_value = bind_map["pe_col"].value
+        if not isinstance(row_value, tirx.FloorDiv) or not _uses_var(row_value, "pe_id"):
+            raise ValueError("Sunway S2 GEMM invariant failed: PE row mapping is invalid")
+        if not isinstance(col_value, tirx.FloorMod) or not _uses_var(col_value, "pe_id"):
+            raise ValueError("Sunway S2 GEMM invariant failed: PE column mapping is invalid")
+        round_loops = {
+            loop.loop_var.name: loop
+            for loop in loops
+            if loop.loop_var.name in {"bx_round", "by_round"}
+        }
+        expected_rounds = {
+            "by_round": (
+                metadata["sunway.block_tiles_m"] + config.cpe_rows - 1
+            )
+            // config.cpe_rows,
+            "bx_round": (
+                metadata["sunway.block_tiles_n"] + config.cpe_cols - 1
+            )
+            // config.cpe_cols,
+        }
+        if set(round_loops) != set(expected_rounds) or any(
+            loop.kind != tirx.ForKind.SERIAL
+            or int(loop.extent) != expected_rounds[name]
+            for name, loop in round_loops.items()
+        ):
+            raise ValueError("Sunway S2 GEMM invariant failed: mesh round loops are invalid")
+        guard_conditions: list[tirx.PrimExpr] = []
+
+        def collect_guard(node: object) -> None:
+            if isinstance(node, tirx.IfThenElse):
+                guard_conditions.append(node.condition)
+
+        tirx.stmt_functor.post_order_visit(func.body, collect_guard)
+        has_row_guard = any(
+            _uses_var(condition, "pe_row")
+            or (
+                _uses_var(condition, "pe_id")
+                and _contains_node_type(condition, tirx.FloorDiv)
+            )
+            for condition in guard_conditions
+        )
+        has_col_guard = any(
+            _uses_var(condition, "pe_col")
+            or (
+                _uses_var(condition, "pe_id")
+                and _contains_node_type(condition, tirx.FloorMod)
+            )
+            for condition in guard_conditions
+        )
+        needs_row_guard = metadata["sunway.block_tiles_m"] % config.cpe_rows != 0
+        needs_col_guard = metadata["sunway.block_tiles_n"] % config.cpe_cols != 0
+        if (needs_row_guard and not has_row_guard) or (needs_col_guard and not has_col_guard):
+            raise ValueError("Sunway S2 GEMM invariant failed: mesh bounds guards are incomplete")
 
     dma_row_loops = [loop for loop in loops if loop.loop_var.name.startswith("sunway_dma_row_")]
     if len(dma_row_loops) != 3:
@@ -533,18 +719,36 @@ def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) ->
         for key in (
             "sunway.cpe_count",
             "sunway.active_cpes",
+            "sunway.cpe_rows",
+            "sunway.cpe_cols",
             "sunway.block_tiles_m",
             "sunway.block_tiles_n",
+            "sunway.k_panels",
             "sunway.tile_m",
             "sunway.tile_n",
             "sunway.tile_k",
+            "sunway.vector_width",
             "sunway.pipeline_stages",
             "sunway.ldm_bytes",
         )
     }
+    ownership = str(func.attrs.get("sunway.ownership", ""))
     expected_workers = config.cpe_rows * config.cpe_cols
-    if metadata["sunway.cpe_count"] != expected_workers or metadata["sunway.active_cpes"] != 1:
-        raise ValueError("Sunway S3 GEMM invariant failed: invalid G0 CPE ownership metadata")
+    expected_active_cpes = 1
+    if ownership == "mesh_2d":
+        expected_active_cpes = _mesh_owner_count(
+            metadata["sunway.block_tiles_m"],
+            metadata["sunway.block_tiles_n"],
+            config.cpe_rows,
+            config.cpe_cols,
+        )
+    if (
+        metadata["sunway.cpe_count"] != expected_workers
+        or metadata["sunway.cpe_rows"] != config.cpe_rows
+        or metadata["sunway.cpe_cols"] != config.cpe_cols
+        or metadata["sunway.active_cpes"] != expected_active_cpes
+    ):
+        raise ValueError("Sunway S3 GEMM invariant failed: invalid CPE ownership metadata")
     if metadata["sunway.pipeline_stages"] != 1:
         raise ValueError("Sunway S3 GEMM invariant failed: G0 requires one pipeline stage")
     if metadata["sunway.ldm_bytes"] > config.ldm_bytes_per_cpe:
@@ -609,11 +813,12 @@ def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) ->
     if not (float_multiply and float_add and has_load and has_store):
         raise ValueError("Sunway S3 GEMM invariant failed: scalar FP32 multiply/add is missing")
 
-    block_loops = {loop.loop_var.name: loop for loop in loops if loop.loop_var.name in {"bx", "by"}}
-    if set(block_loops) != {"bx", "by"} or any(
+    dimension_names = {"bx", "by"} if ownership == "single" else {"bx_round", "by_round"}
+    block_loops = {loop.loop_var.name: loop for loop in loops if loop.loop_var.name in dimension_names}
+    if set(block_loops) != dimension_names or any(
         loop.kind != tirx.ForKind.SERIAL for loop in block_loops.values()
     ):
-        raise ValueError("Sunway S3 GEMM invariant failed: block tiles must remain static serial loops")
+        raise ValueError("Sunway S3 GEMM invariant failed: ownership loops must remain static and serial")
     dma_row_loops = [loop for loop in loops if loop.loop_var.name.startswith("sunway_dma_row_")]
     if len(dma_row_loops) != 3:
         raise ValueError("Sunway S3 GEMM invariant failed: expected three native row-transfer loops")
@@ -640,9 +845,15 @@ def lower_gemm_semantic_to_native_tir(mod: IRModule, config: SunwayTargetConfig)
 
     block_tiles_m = int(_only_prim_func(mod).attrs["sunway.block_tiles_m"])
     block_tiles_n = int(_only_prim_func(mod).attrs["sunway.block_tiles_n"])
+    ownership = str(_only_prim_func(mod).attrs.get("sunway.ownership", "single"))
     mod = _lower_semantic_calls_to_native(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tirx.transform.Simplify()(mod)
     mod = tirx.transform.RemoveNoOp()(mod)
-    mod = _restore_unit_block_dimensions(mod, block_tiles_m, block_tiles_n)
+    if ownership == "mesh_2d":
+        rounds_m = (block_tiles_m + config.cpe_rows - 1) // config.cpe_rows
+        rounds_n = (block_tiles_n + config.cpe_cols - 1) // config.cpe_cols
+        mod = _restore_serial_dimensions(mod, "by_round", rounds_m, "bx_round", rounds_n)
+    else:
+        mod = _restore_unit_block_dimensions(mod, block_tiles_m, block_tiles_n)
     return verify_gemm_native_tir(mod, config)

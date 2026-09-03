@@ -5,7 +5,11 @@ import tilelang.language as T
 from tilelang.backend.module import create_backend_context
 from tilelang.sunway.runtime import SunwayKernelManifest
 from tilelang.sunway.target import get_sunway_target_config
-from testing.python.sunway.gemm_cases import make_gemm_32, make_gemm_m32_n16_k32
+from testing.python.sunway.gemm_cases import (
+    make_gemm_32,
+    make_gemm_128_k64,
+    make_gemm_m32_n16_k32,
+)
 
 
 def test_sunway_target_selects_dedicated_backend() -> None:
@@ -133,3 +137,32 @@ def test_sunway_non_square_scalar_gemm_uses_the_same_aot_emitter(tmp_path) -> No
     assert "for (int by = 0; by < 2; ++by)" in cpe
     assert [argument.shape for argument in manifest.arguments] == [(32, 32), (32, 16), (32, 16)]
     assert [argument.role for argument in manifest.arguments] == ["input", "input", "output"]
+
+
+def test_sunway_mesh_gemm_uses_generic_aot_emitter(tmp_path) -> None:
+    artifact = tilelang.lower(
+        make_gemm_128_k64(),
+        target={
+            "kind": "sunway",
+            "gemm_ownership": "mesh_2d",
+            "gemm_compute": "scalar",
+            "output_dir": str(tmp_path),
+            "output_indices": [2],
+        },
+        runtime_only=True,
+    )
+
+    cpe = (tmp_path / "cpe_gemm_128_k64.c").read_text()
+    manifest = SunwayKernelManifest.read(tmp_path / "manifest.json")
+
+    assert "_MYID == 0" not in cpe
+    assert "_MYID >> 3" in cpe
+    assert "_MYID & 7" in cpe
+    assert "for (int bx_round = 0; bx_round < 1; ++bx_round)" in cpe
+    assert "for (int by_round = 0; by_round < 1; ++by_round)" in cpe
+    assert artifact.kernel_source == cpe
+    assert [argument.shape for argument in manifest.arguments] == [
+        (128, 64),
+        (64, 128),
+        (128, 128),
+    ]

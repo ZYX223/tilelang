@@ -10,6 +10,7 @@ from tvm import IRModule, tirx
 from testing.python.sunway.gemm_cases import (
     make_gemm_32,
     make_gemm_128_k64,
+    make_gemm_m160_n144_k32,
     make_gemm_m32_n16_k32,
 )
 from tilelang.sunway.op.gemm.plan import SunwayGemmPlan
@@ -58,7 +59,7 @@ def _is_worker_zero(condition: tirx.PrimExpr) -> bool:
 
 def _lower(factory, config: SunwayTargetConfig | None = None) -> IRModule:
     config = config or SunwayTargetConfig()
-    target = create_backend_context({"kind": "sunway"}).target
+    target = create_backend_context({"kind": "sunway", **config.to_mapping()}).target
     mod = tvm.IRModule.from_expr(factory())
     with target:
         s1 = annotate_sunway_tir(tirx.transform.BindTarget(target)(mod))
@@ -120,6 +121,62 @@ def test_g1_plan_rejects_an_unsupported_simd_width() -> None:
 
     with pytest.raises(ValueError, match="requires SIMD width 8"):
         SunwayGemmPlan.from_prim_func(make_gemm_128_k64(), config)
+
+
+@pytest.mark.parametrize(
+    ("factory", "rounds_m", "rounds_n"),
+    [
+        (make_gemm_128_k64, 1, 1),
+        (make_gemm_m160_n144_k32, 2, 2),
+    ],
+)
+def test_g1_s2_materializes_mesh_stride_ownership(factory, rounds_m: int, rounds_n: int) -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d")
+
+    func = _only_prim_func(_lower(factory, config))
+
+    assert str(func.attrs["sunway.ownership"]) == "mesh_2d"
+    assert int(func.attrs["sunway.cpe_rows"]) == 8
+    assert int(func.attrs["sunway.cpe_cols"]) == 8
+    assert int(func.attrs["sunway.active_cpes"]) == 64
+
+    loops: dict[str, tirx.For] = {}
+    binds: dict[str, tirx.Bind] = {}
+    conditions: list[tirx.PrimExpr] = []
+    worker_zero: list[tirx.IfThenElse] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, tirx.For):
+            loops[node.loop_var.name] = node
+        elif isinstance(node, tirx.Bind):
+            binds[node.var.name] = node
+        elif isinstance(node, tirx.IfThenElse):
+            conditions.append(node.condition)
+            if _is_worker_zero(node.condition):
+                worker_zero.append(node)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+
+    assert set(binds) == {"pe_id", "pe_row", "pe_col"}
+    assert _call_name(binds["pe_id"].value) == "tilelang_sunway_pe_id"
+    assert isinstance(binds["pe_row"].value, tirx.FloorDiv)
+    assert isinstance(binds["pe_col"].value, tirx.FloorMod)
+    assert int(loops["by_round"].extent) == rounds_m
+    assert int(loops["bx_round"].extent) == rounds_n
+    assert loops["by_round"].kind == tirx.ForKind.SERIAL
+    assert loops["bx_round"].kind == tirx.ForKind.SERIAL
+    if rounds_m > 1 or rounds_n > 1:
+        condition_text = " ".join(map(str, conditions))
+        assert "pe_id // 8" in condition_text
+        assert "pe_id % 8" in condition_text
+        assert "by_round * 8" in condition_text
+        assert "bx_round * 8" in condition_text
+    assert not worker_zero
+
+    counts = Counter(_call_names(func.body))
+    assert counts["tilelang_sunway_pe_id"] == 1
+    assert counts["tilelang_sunway_dma_get"] == 2
+    assert counts["tilelang_sunway_dma_put"] == 1
 
 
 @pytest.mark.parametrize(
@@ -274,6 +331,35 @@ def test_s3_resolves_native_leaves_and_preserves_static_buffers(factory) -> None
     assert counts["tilelang_sunway_reply_wait"] == 3
     assert allocated
     assert all(all(isinstance(dim, tirx.IntImm) for dim in buffer.shape) for buffer in allocated)
+
+
+def test_g1_s3_preserves_mesh_ownership_and_native_dma() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d")
+
+    func = _only_prim_func(_lower_s3(make_gemm_128_k64, config))
+
+    names = Counter(_call_names(func.body))
+    loops: dict[str, tirx.For] = {}
+    binds: dict[str, tirx.Bind] = {}
+
+    def visit(node: object) -> None:
+        if isinstance(node, tirx.For):
+            loops[node.loop_var.name] = node
+        elif isinstance(node, tirx.Bind):
+            binds[node.var.name] = node
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+
+    assert str(func.attrs["sunway.phase"]) == "S3"
+    assert str(func.attrs["sunway.ownership"]) == "mesh_2d"
+    assert int(func.attrs["sunway.active_cpes"]) == 64
+    assert set(binds) == {"pe_id"}
+    assert _call_name(binds["pe_id"].value) == "_MYID"
+    assert set(loops) >= {"bx_round", "by_round"}
+    assert names["athread_get"] == 2
+    assert names["athread_put"] == 1
+    assert names["tilelang_sunway_reply_wait"] == 3
+    assert names["tilelang_sunway_pe_id"] == 0
 
 
 def test_s3_verifier_rejects_a_residual_semantic_call() -> None:
