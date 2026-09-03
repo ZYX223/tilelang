@@ -13,7 +13,15 @@ namespace tvm {
 namespace tl {
 
 bool TargetIsCPU(Target target) {
-  return target->GetTargetDeviceType() == kDLCPU;
+  if (target->GetTargetDeviceType() != kDLCPU) {
+    return false;
+  }
+  for (const auto &key : target->keys) {
+    if (key == "sunway") {
+      return false;
+    }
+  }
+  return true;
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
