@@ -91,3 +91,83 @@ Standalone generated executables remain a separate path and can still be run
 with the configured `swrun` launcher. Their owning `main` must call
 `athread_init()` exactly once before invoking the first generated operator; the
 operator functions themselves remain reusable and do not initialize CRTS.
+
+## Scalar GEMM G0
+
+G0 is the first end-to-end correctness baseline for the official TileLang tiled
+GEMM frontend. The same frontend constructs used by other backends are retained:
+`T.Kernel`, `T.alloc_shared`, `T.alloc_fragment`, `T.Pipelined`, `T.copy`, and
+`T.gemm`. Sunway-specific ownership, DMA, LDM, and native calls are introduced by
+the backend after the frontend program has been parsed.
+
+Generate the square and non-square projects on the Dell build host:
+
+```bash
+cd /mnt/sda/zyx/project/tilelang-paper1-clean
+
+/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3 \
+  examples/sunway/gemm_32.py \
+  --output-dir /tmp/tilelang-gemm-32-generated-20260903
+
+/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3 \
+  examples/sunway/gemm_m32_n16_k32.py \
+  --output-dir /tmp/tilelang-gemm-m32-n16-k32-generated-20260903
+```
+
+Each directory contains the S1, S2, and S3 TIR dumps, MPE C, CPE C, a common
+header, a manifest, and the numerical test `main`. S1 retains the tiled TileLang
+program, S2 exposes semantic DMA and scalar arithmetic, and S3 contains the
+native Sunway leaves consumed by C code generation.
+
+Cross-compile both projects with the SWGCC-1307 toolchain and matching SDK
+overlay:
+
+```bash
+/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3 \
+  examples/sunway/package_aot.py \
+  --generated-dir /tmp/tilelang-gemm-32-generated-20260903 \
+  --package-dir /tmp/tilelang-gemm-32-package-20260903 \
+  --toolchain-root /mnt/sda/zyx/toolchains/swgcc710-tools-SEA-1307 \
+  --overlay-root /mnt/sda/zyx/toolchains/sw9a-sdk-overlay
+
+/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3 \
+  examples/sunway/package_aot.py \
+  --generated-dir /tmp/tilelang-gemm-m32-n16-k32-generated-20260903 \
+  --package-dir /tmp/tilelang-gemm-m32-n16-k32-package-20260903 \
+  --toolchain-root /mnt/sda/zyx/toolchains/swgcc710-tools-SEA-1307 \
+  --overlay-root /mnt/sda/zyx/toolchains/sw9a-sdk-overlay
+```
+
+Deploy the packages directly and run them through `swrun -E 64 -i` on SW9A:
+
+```bash
+/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3 \
+  examples/sunway/run_aot.py \
+  --package-dir /tmp/tilelang-gemm-32-package-20260903 \
+  --remote-host root@10.10.10.22 \
+  --remote-root /tmp/tilelang-runs \
+  --executable gemm_32 \
+  --deployment-id gemm-g0-scalar-20260903
+
+/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3 \
+  examples/sunway/run_aot.py \
+  --package-dir /tmp/tilelang-gemm-m32-n16-k32-package-20260903 \
+  --remote-host root@10.10.10.22 \
+  --remote-root /tmp/tilelang-runs \
+  --executable gemm_m32_n16_k32 \
+  --deployment-id gemm-g0-nonsquare-20260903
+```
+
+Successful target output is:
+
+```text
+gemm_32 passed: M=32 N=32 K=32
+gemm_m32_n16_k32 passed: M=32 N=16 K=32
+```
+
+G0 deliberately assigns all output tiles to CPE 0 and uses scalar FP32
+multiply-add. It proves frontend compatibility, progressive lowering, generated
+MPE/CPE compilation, deployment, and numerical correctness. It is not a
+performance result. Later stages distribute ownership across 64 CPEs before
+adding SIMD, multi-K tiling, double buffering, mesh communication, and offline
+tuning.
