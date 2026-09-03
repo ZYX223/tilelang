@@ -214,9 +214,18 @@ def test_generic_aot_scripts_do_not_name_a_kernel() -> None:
     package_source = (example_dir / "package_aot.py").read_text(encoding="utf-8")
     run_source = (example_dir / "run_aot.py").read_text(encoding="utf-8")
 
-    for name in ("copy_128", "gemm_32", "gemm_m32_n16_k32"):
+    for name in ("copy_128", "gemm_32", "gemm_m32_n16_k32", "gemm_128_k64"):
         assert name not in package_source
         assert name not in run_source
+
+
+def test_sunway_codegen_selects_simd_from_the_native_leaf_not_a_kernel_name() -> None:
+    source = (Path(__file__).parents[3] / "tilelang" / "sunway" / "codegen.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "tilelang_sunway_native_fma_f32x8" in source
+    assert "gemm_128_k64" not in source
 
 
 def test_distributed_multik_gemm_example_keeps_official_frontend_and_reference() -> None:

@@ -48,6 +48,8 @@ _BINARY_INTRINSICS = {
     "tirx.shift_right": ">>",
 }
 
+_NATIVE_FMA_F32X8 = "tilelang_sunway_native_fma_f32x8"
+
 
 def _c_identifier(value: object) -> str:
     identifier = re.sub(r"[^A-Za-z0-9_]", "_", str(value))
@@ -81,6 +83,18 @@ def _extern_name(call: tirx.Call) -> str | None:
     return call.args[0].value
 
 
+def _contains_extern(node: object, name: str) -> bool:
+    found = False
+
+    def visit(candidate: object) -> None:
+        nonlocal found
+        if isinstance(candidate, tirx.Call) and _extern_name(candidate) == name:
+            found = True
+
+    tirx.stmt_functor.post_order_visit(node, visit)
+    return found
+
+
 @dataclass(frozen=True, slots=True)
 class _Kernel:
     name: str
@@ -95,6 +109,10 @@ class _Kernel:
     @property
     def cpe_entry(self) -> str:
         return f"{self.name}_cpe"
+
+    @property
+    def uses_f32x8(self) -> bool:
+        return _contains_extern(self.func.body, _NATIVE_FMA_F32X8)
 
 
 def _extract_kernel(mod: IRModule) -> _Kernel:
@@ -141,15 +159,24 @@ class _CPEEmitter:
     def emit(self) -> str:
         header = f"{self.kernel.name}_common.h"
         self.line('#include "slave.h"')
+        if self.kernel.uses_f32x8:
+            self.line('#include "simd.h"')
         self.line(f'#include "{header}"')
         self.line()
+        if self.kernel.uses_f32x8:
+            self._emit_f32x8_helper()
+            self.line()
         self.line(f"__thread_local {self.kernel.args_type} ldm_args;")
         for buffer in self.kernel.locals:
             c_name = _c_identifier(buffer.name)
             if c_name == "reply" and _c_type(buffer.dtype) == "int" and _static_extent(buffer) == 1:
                 self.line("volatile __thread_local int reply;")
             else:
-                self.line(f"__thread_local {_c_type(buffer.dtype)} {c_name}[{_static_extent(buffer)}];")
+                alignment = " __attribute__((aligned(32)))" if self.kernel.uses_f32x8 else ""
+                self.line(
+                    f"__thread_local {_c_type(buffer.dtype)} {c_name}[{_static_extent(buffer)}]"
+                    f"{alignment};"
+                )
         self.line()
         self.line(f"void {self.kernel.cpe_entry}({self.kernel.args_type} *global_args) {{")
         self.indent += 1
@@ -164,6 +191,18 @@ class _CPEEmitter:
         self.indent -= 1
         self.line("}")
         return "\n".join(self.lines) + "\n"
+
+    def _emit_f32x8_helper(self) -> None:
+        """Emit the native leaf validated by the standalone SWGCC probe."""
+
+        self.line(f"static inline void {_NATIVE_FMA_F32X8}(float a, const float *b, float *c) {{")
+        self.indent += 1
+        self.line("floatv8 a_vector = simd_set_floatv8(a, a, a, a, a, a, a, a);")
+        self.line("floatv8 b_vector = *(const floatv8 *)b;")
+        self.line("floatv8 c_vector = *(floatv8 *)c;")
+        self.line("*(floatv8 *)c = simd_vmas(a_vector, b_vector, c_vector);")
+        self.indent -= 1
+        self.line("}")
 
     def emit_stmt(self, stmt: object) -> None:
         if isinstance(stmt, tirx.SeqStmt):
@@ -249,6 +288,10 @@ class _CPEEmitter:
             value = "reply" if reply == "&reply" else f"*({reply})"
             self.line(f"while ({value} != {count}) {{")
             self.line("}")
+            return
+        if name == _NATIVE_FMA_F32X8:
+            scalar, b_pointer, c_pointer = map(self.emit_expr, args)
+            self.line(f"{_NATIVE_FMA_F32X8}({scalar}, {b_pointer}, {c_pointer});")
             return
         raise ValueError(f"Sunway CPE codegen does not support external call {name!r}")
 

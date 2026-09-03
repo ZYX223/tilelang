@@ -4,10 +4,11 @@ from tilelang.sunway.target import is_sunway_target
 from tilelang.tileop.gemm.registry import register_gemm_impl
 
 from .gemm_scalar import GEMM_INST_SCALAR, GemmScalar
+from .gemm_vmad import lower_gemm_compute_to_simd
 from .plan import SunwayGemmPlan
 
 
-__all__ = ["SunwayGemmPlan"]
+__all__ = ["SunwayGemmPlan", "lower_gemm_compute_to_simd"]
 
 
 register_gemm_impl(

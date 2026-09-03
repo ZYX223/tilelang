@@ -16,6 +16,7 @@ _SEMANTIC_TO_NATIVE = {
     "tilelang_sunway_dma_get": "athread_get",
     "tilelang_sunway_dma_put": "athread_put",
     "tilelang_sunway_dma_wait": "tilelang_sunway_reply_wait",
+    "tilelang_sunway_fma_f32x8": "tilelang_sunway_native_fma_f32x8",
 }
 _SEMANTIC_CALLS = frozenset(_SEMANTIC_TO_NATIVE)
 _NATIVE_CALLS = frozenset(_SEMANTIC_TO_NATIVE.values())
@@ -282,7 +283,7 @@ def verify_semantic_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
         if str(func.attrs.get("sunway.phase", "")) != phase:
             raise ValueError("Sunway S2 verifier received a function from another phase")
         kernel_kind = str(func.attrs.get("sunway.kernel_kind", ""))
-        if kernel_kind == "gemm_scalar":
+        if kernel_kind in {"gemm_scalar", "gemm_simd"}:
             from .gemm_transform import _verify_gemm_semantic_func
 
             return _verify_gemm_semantic_func(func, config)
@@ -343,7 +344,7 @@ def lower_semantic_to_native_tir(
         for func in mod.functions.values()
         if isinstance(func, tirx.PrimFunc)
     }
-    if kernel_kinds == {"gemm_scalar"}:
+    if kernel_kinds in ({"gemm_scalar"}, {"gemm_simd"}):
         from .gemm_transform import lower_gemm_semantic_to_native_tir
 
         return lower_gemm_semantic_to_native_tir(mod, config)
@@ -360,7 +361,7 @@ def verify_native_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
         if str(func.attrs.get("sunway.phase", "")) != phase:
             raise ValueError("Sunway S3 verifier received a function from another phase")
         kernel_kind = str(func.attrs.get("sunway.kernel_kind", ""))
-        if kernel_kind == "gemm_scalar":
+        if kernel_kind in {"gemm_scalar", "gemm_simd"}:
             from .gemm_transform import _verify_gemm_native_func
 
             return _verify_gemm_native_func(func, config)

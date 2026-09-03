@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 
 import tilelang
-from tvm import IRModule, tirx
+from tvm import IRModule, arith, tirx
 
 from .op.gemm.plan import SunwayGemmPlan
 from .target import SunwayTargetConfig
@@ -17,13 +17,22 @@ _DMA_2D_CALLS = {
     "tilelang_sunway_dma_put_2d": "tilelang_sunway_dma_put",
 }
 _DMA_CALLS = frozenset(_DMA_2D_CALLS.values())
-_NATIVE_CALLS = frozenset({"_MYID", "athread_get", "athread_put", "tilelang_sunway_reply_wait"})
+_NATIVE_CALLS = frozenset(
+    {
+        "_MYID",
+        "athread_get",
+        "athread_put",
+        "tilelang_sunway_reply_wait",
+        "tilelang_sunway_native_fma_f32x8",
+    }
+)
 _SEMANTIC_CALLS = frozenset(
     {
         "tilelang_sunway_pe_id",
         "tilelang_sunway_dma_get",
         "tilelang_sunway_dma_put",
         "tilelang_sunway_dma_wait",
+        "tilelang_sunway_fma_f32x8",
     }
 )
 
@@ -394,7 +403,7 @@ def attach_scalar_gemm_plan(
             block_tiles_m, block_tiles_n = expected_block_tiles
         attrs = {
             "sunway.phase": "S2",
-            "sunway.kernel_kind": "gemm_scalar",
+            "sunway.kernel_kind": "gemm_simd" if plan.compute == "simd" else "gemm_scalar",
             "sunway.cpe_count": plan.workers,
             "sunway.active_cpes": plan.active_cpes,
             "sunway.cpe_rows": plan.cpe_rows,
@@ -426,8 +435,6 @@ def lower_gemm_program_to_semantic_tir(mod: IRModule, config: SunwayTargetConfig
 
     source_func = _only_prim_func(mod)
     plan = SunwayGemmPlan.from_prim_func(source_func, config)
-    if plan.compute == "simd":
-        raise ValueError("Sunway G1 SIMD compute lowering is not installed")
     block_tiles = _bound_block_tile_extents(source_func)
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
@@ -436,6 +443,10 @@ def lower_gemm_program_to_semantic_tir(mod: IRModule, config: SunwayTargetConfig
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tirx.transform.Simplify()(mod)
+    if plan.compute == "simd":
+        from .op.gemm.gemm_vmad import lower_gemm_compute_to_simd
+
+        mod = lower_gemm_compute_to_simd(mod, plan)
     if plan.ownership == "mesh_2d":
         mod = _restore_mesh_round_dimensions(mod, plan)
     else:
@@ -495,10 +506,56 @@ def _required_positive_attr(func: tirx.PrimFunc, key: str) -> int:
     return result
 
 
+def _verify_f32x8_call(
+    func: tirx.PrimFunc,
+    *,
+    call_name: str,
+    k_panels: int,
+    phase: str,
+) -> None:
+    calls: list[tirx.Call] = []
+    k_panel_loops: list[tirx.For] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, tirx.Call) and _call_name(node) == call_name:
+            calls.append(node)
+        elif isinstance(node, tirx.For) and node.loop_var.name == "ko":
+            k_panel_loops.append(node)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    if len(calls) != 1:
+        raise ValueError(f"Sunway {phase} GEMM invariant failed: expected one {call_name} call")
+    if len(k_panel_loops) != 1 or int(k_panel_loops[0].extent) != k_panels:
+        raise ValueError(f"Sunway {phase} GEMM invariant failed: invalid K-panel loop")
+    if _named_calls(k_panel_loops[0].body).count(call_name) != 1:
+        raise ValueError(f"Sunway {phase} GEMM invariant failed: FP32x8 FMA is outside the K-panel loop")
+
+    call = calls[0]
+    if len(call.args) != 4 or str(call.args[1].dtype) != "float32":
+        raise ValueError(f"Sunway {phase} GEMM invariant failed: invalid FP32x8 FMA signature")
+    analyzer = arith.Analyzer()
+    for pointer in call.args[2:]:
+        if (
+            not isinstance(pointer, tirx.Call)
+            or str(getattr(pointer.op, "name", "")) != "tirx.tvm_access_ptr"
+            or len(pointer.args) != 5
+            or not isinstance(pointer.args[3], tirx.IntImm)
+            or int(pointer.args[3]) != 8
+        ):
+            raise ValueError(f"Sunway {phase} GEMM invariant failed: invalid FP32x8 access pointer")
+        remainder = analyzer.simplify(tirx.FloorMod(pointer.args[2], 8))
+        if not isinstance(remainder, tirx.IntImm) or int(remainder) != 0:
+            raise ValueError(
+                f"Sunway {phase} GEMM invariant failed: FP32x8 pointers must be 32-byte aligned"
+            )
+
+
 def _verify_gemm_semantic_func(func: tirx.PrimFunc, config: SunwayTargetConfig) -> tirx.PrimFunc:
     if str(func.attrs.get("sunway.phase", "")) != "S2":
         raise ValueError("Sunway S2 GEMM verifier received a function from another phase")
-    if str(func.attrs.get("sunway.kernel_kind", "")) != "gemm_scalar":
+    compute = str(func.attrs.get("sunway.compute", ""))
+    expected_kernel_kind = "gemm_simd" if compute == "simd" else "gemm_scalar"
+    if str(func.attrs.get("sunway.kernel_kind", "")) != expected_kernel_kind:
         raise ValueError("Sunway S2 GEMM verifier received another kernel kind")
 
     metadata = {
@@ -520,11 +577,12 @@ def _verify_gemm_semantic_func(func: tirx.PrimFunc, config: SunwayTargetConfig) 
         )
     }
     ownership = str(func.attrs.get("sunway.ownership", ""))
-    compute = str(func.attrs.get("sunway.compute", ""))
     if ownership not in {"single", "mesh_2d"}:
         raise ValueError(f"Sunway S2 GEMM invariant failed: unsupported ownership {ownership!r}")
     if compute not in {"scalar", "simd"}:
         raise ValueError(f"Sunway S2 GEMM invariant failed: unsupported compute mode {compute!r}")
+    if compute == "simd" and metadata["sunway.vector_width"] != 8:
+        raise ValueError("Sunway S2 GEMM invariant failed: native FP32 compute requires vector width 8")
     expected_workers = config.cpe_rows * config.cpe_cols
     if metadata["sunway.cpe_count"] != expected_workers:
         raise ValueError("Sunway S2 GEMM invariant failed: CPE count does not match the target mesh")
@@ -561,12 +619,34 @@ def _verify_gemm_semantic_func(func: tirx.PrimFunc, config: SunwayTargetConfig) 
         "tilelang_sunway_dma_get": 2,
         "tilelang_sunway_dma_put": 1,
         "tilelang_sunway_dma_wait": 3,
+        "tilelang_sunway_fma_f32x8": 1 if compute == "simd" else 0,
     }
     for name, expected in expected_calls.items():
         if counts[name] != expected:
             raise ValueError(
                 f"Sunway S2 GEMM invariant failed: expected {expected} {name} call(s), found {counts[name]}"
             )
+
+    float_arithmetic: list[object] = []
+    tirx.stmt_functor.post_order_visit(
+        func.body,
+        lambda node: float_arithmetic.append(node)
+        if isinstance(node, (tirx.Add, tirx.Mul)) and str(node.dtype) == "float32"
+        else None,
+    )
+    has_float_add = any(isinstance(node, tirx.Add) for node in float_arithmetic)
+    has_float_multiply = any(isinstance(node, tirx.Mul) for node in float_arithmetic)
+    if compute == "scalar" and not (has_float_add and has_float_multiply):
+        raise ValueError("Sunway S2 GEMM invariant failed: scalar FP32 multiply/add is missing")
+    if compute == "simd" and float_arithmetic:
+        raise ValueError("Sunway S2 GEMM invariant failed: SIMD compute retained scalar FP32 arithmetic")
+    if compute == "simd":
+        _verify_f32x8_call(
+            func,
+            call_name="tilelang_sunway_fma_f32x8",
+            k_panels=metadata["sunway.k_panels"],
+            phase="S2",
+        )
 
     loops: list[tirx.For] = []
     owners: list[tirx.IfThenElse] = []
@@ -713,7 +793,9 @@ def _is_static_compact(buffer: tirx.Buffer) -> bool:
 def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) -> tirx.PrimFunc:
     if str(func.attrs.get("sunway.phase", "")) != "S3":
         raise ValueError("Sunway S3 GEMM verifier received a function from another phase")
-    if str(func.attrs.get("sunway.kernel_kind", "")) != "gemm_scalar":
+    compute = str(func.attrs.get("sunway.compute", ""))
+    expected_kernel_kind = "gemm_simd" if compute == "simd" else "gemm_scalar"
+    if str(func.attrs.get("sunway.kernel_kind", "")) != expected_kernel_kind:
         raise ValueError("Sunway S3 GEMM verifier received another kernel kind")
 
     metadata = {
@@ -735,6 +817,8 @@ def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) ->
         )
     }
     ownership = str(func.attrs.get("sunway.ownership", ""))
+    if compute == "simd" and metadata["sunway.vector_width"] != 8:
+        raise ValueError("Sunway S3 GEMM invariant failed: native FP32 compute requires vector width 8")
     expected_workers = config.cpe_rows * config.cpe_cols
     expected_active_cpes = 1
     if ownership == "mesh_2d":
@@ -772,6 +856,7 @@ def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) ->
         "athread_get": 2,
         "athread_put": 1,
         "tilelang_sunway_reply_wait": 3,
+        "tilelang_sunway_native_fma_f32x8": 1 if compute == "simd" else 0,
     }
     for name, expected in expected_calls.items():
         if counts[name] != expected:
@@ -812,8 +897,17 @@ def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) ->
             has_store = True
 
     tirx.stmt_functor.post_order_visit(func.body, visit_arithmetic)
-    if not (float_multiply and float_add and has_load and has_store):
+    if compute == "scalar" and not (float_multiply and float_add and has_load and has_store):
         raise ValueError("Sunway S3 GEMM invariant failed: scalar FP32 multiply/add is missing")
+    if compute == "simd" and (float_multiply or float_add):
+        raise ValueError("Sunway S3 GEMM invariant failed: SIMD compute retained scalar FP32 arithmetic")
+    if compute == "simd":
+        _verify_f32x8_call(
+            func,
+            call_name="tilelang_sunway_native_fma_f32x8",
+            k_panels=metadata["sunway.k_panels"],
+            phase="S3",
+        )
 
     dimension_names = {"bx", "by"} if ownership == "single" else {"bx_round", "by_round"}
     block_loops = {loop.loop_var.name: loop for loop in loops if loop.loop_var.name in dimension_names}

@@ -362,11 +362,121 @@ def test_g1_s3_preserves_mesh_ownership_and_native_dma() -> None:
     assert names["tilelang_sunway_pe_id"] == 0
 
 
-def test_g1_rejects_simd_until_the_compute_lowering_is_installed() -> None:
+def test_g1_s2_rewrites_scalar_compute_to_abstract_f32x8() -> None:
     config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
 
-    with pytest.raises(ValueError, match="SIMD compute lowering is not installed"):
-        _lower(make_gemm_128_k64, config)
+    func = _only_prim_func(_lower(make_gemm_128_k64, config))
+    calls = Counter(_call_names(func.body))
+    loops: dict[str, tirx.For] = {}
+    scalar_accumulation_stores: list[tirx.BufferStore] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, tirx.For):
+            loops[node.loop_var.name] = node
+        elif isinstance(node, tirx.BufferStore):
+            arithmetic: list[object] = []
+            tirx.stmt_functor.post_order_visit(
+                node.value,
+                lambda child: arithmetic.append(child)
+                if isinstance(child, (tirx.Add, tirx.Mul)) and str(child.dtype) == "float32"
+                else None,
+            )
+            if arithmetic:
+                scalar_accumulation_stores.append(node)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+
+    assert str(func.attrs["sunway.compute"]) == "simd"
+    assert str(func.attrs["sunway.kernel_kind"]) == "gemm_simd"
+    assert int(func.attrs["sunway.vector_width"]) == 8
+    assert calls["tilelang_sunway_fma_f32x8"] == 1
+    assert int(loops["sunway_simd_m"].extent) == 16
+    assert int(loops["sunway_simd_k"].extent) == 32
+    assert int(loops["sunway_simd_n_vector"].extent) == 2
+    assert not scalar_accumulation_stores
+
+
+def test_g1_scalar_s2_keeps_ordinary_fp32_accumulation() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="scalar")
+
+    func = _only_prim_func(_lower(make_gemm_128_k64, config))
+    names = Counter(_call_names(func.body))
+    arithmetic: list[object] = []
+    tirx.stmt_functor.post_order_visit(
+        func.body,
+        lambda node: arithmetic.append(node)
+        if isinstance(node, (tirx.Add, tirx.Mul)) and str(node.dtype) == "float32"
+        else None,
+    )
+
+    assert str(func.attrs["sunway.compute"]) == "scalar"
+    assert str(func.attrs["sunway.kernel_kind"]) == "gemm_scalar"
+    assert names["tilelang_sunway_fma_f32x8"] == 0
+    assert any(isinstance(node, tirx.Add) for node in arithmetic)
+    assert any(isinstance(node, tirx.Mul) for node in arithmetic)
+
+
+def test_g1_s3_resolves_abstract_f32x8_to_one_native_leaf() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
+
+    func = _only_prim_func(_lower_s3(make_gemm_128_k64, config))
+    calls = Counter(_call_names(func.body))
+
+    assert str(func.attrs["sunway.phase"]) == "S3"
+    assert str(func.attrs["sunway.kernel_kind"]) == "gemm_simd"
+    assert calls["tilelang_sunway_fma_f32x8"] == 0
+    assert calls["tilelang_sunway_native_fma_f32x8"] == 1
+
+
+def test_g1_s3_verifier_rejects_a_residual_abstract_f32x8_leaf() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
+    s3 = _lower_s3(make_gemm_128_k64, config)
+    invalid = _replace_first_extern(
+        s3,
+        "tilelang_sunway_native_fma_f32x8",
+        "tilelang_sunway_fma_f32x8",
+    )
+
+    with pytest.raises(ValueError, match="semantic call.*tilelang_sunway_fma_f32x8"):
+        verify_gemm_native_tir(invalid, config)
+
+
+def test_g1_s3_verifier_rejects_a_misaligned_native_f32x8_pointer() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
+    s3 = _lower_s3(make_gemm_128_k64, config)
+    replaced = False
+
+    def rewrite(node: object) -> object | None:
+        nonlocal replaced
+        if replaced or not isinstance(node, tirx.Call) or _call_name(node) != "tilelang_sunway_native_fma_f32x8":
+            return None
+        arguments = list(node.args)
+        pointer = arguments[2]
+        assert isinstance(pointer, tirx.Call)
+        pointer_arguments = list(pointer.args)
+        pointer_arguments[2] = pointer_arguments[2] + 1
+        arguments[2] = tirx.Call(
+            str(pointer.dtype),
+            pointer.op,
+            pointer_arguments,
+            span=getattr(pointer, "span", None),
+        )
+        replaced = True
+        return tirx.Call(str(node.dtype), node.op, arguments, span=getattr(node, "span", None))
+
+    invalid = _rewrite_body(s3, rewrite)
+    assert replaced
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        verify_gemm_native_tir(invalid, config)
+
+
+def test_g1_s3_verifier_rejects_non_native_vector_width_metadata() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
+    s3 = _lower_s3(make_gemm_128_k64, config)
+    func = _only_prim_func(s3).with_attr("sunway.vector_width", 4)
+
+    with pytest.raises(ValueError, match="vector width 8"):
+        verify_gemm_native_tir(IRModule({"main": func}), config)
 
 
 def test_s3_verifier_rejects_a_residual_semantic_call() -> None:

@@ -166,3 +166,31 @@ def test_sunway_mesh_gemm_uses_generic_aot_emitter(tmp_path) -> None:
         (64, 128),
         (128, 128),
     ]
+
+
+def test_sunway_simd_gemm_emits_the_native_f32x8_helper(tmp_path) -> None:
+    artifact = tilelang.lower(
+        make_gemm_128_k64(),
+        target={
+            "kind": "sunway",
+            "gemm_ownership": "mesh_2d",
+            "gemm_compute": "simd",
+            "output_dir": str(tmp_path),
+            "output_indices": [2],
+        },
+        runtime_only=True,
+    )
+
+    cpe = (tmp_path / "cpe_gemm_128_k64.c").read_text()
+
+    assert '#include "simd.h"' in cpe
+    assert "static inline void tilelang_sunway_native_fma_f32x8(" in cpe
+    assert cpe.count("__attribute__((aligned(32)))") >= 3
+    assert "floatv8" in cpe
+    assert "simd_set_floatv8(" in cpe
+    assert "simd_vmas(" in cpe
+    assert "for (int sunway_simd_m = 0; sunway_simd_m < 16;" in cpe
+    assert "for (int sunway_simd_k = 0; sunway_simd_k < 32;" in cpe
+    assert "for (int sunway_simd_n_vector = 0; sunway_simd_n_vector < 2;" in cpe
+    assert "for (int b_j" not in cpe
+    assert artifact.kernel_source == cpe
