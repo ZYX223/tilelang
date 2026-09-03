@@ -84,14 +84,18 @@ class SunwaySSHExecutor:
         if not package_dir.is_dir():
             raise FileNotFoundError(f"Missing Sunway package directory {package_dir}")
         deployment_id = deployment_id or uuid.uuid4().hex
-        if not _REMOTE_NAME_PATTERN.fullmatch(deployment_id):
+        if deployment_id in {".", ".."} or not _REMOTE_NAME_PATTERN.fullmatch(deployment_id):
             raise ValueError(f"Unsafe Sunway deployment id {deployment_id!r}")
 
         remote_parent = f"{self.remote_root}/{deployment_id}"
         remote_directory = f"{remote_parent}/package"
         self._run_checked(
-            [self.ssh, self.remote_host, f"mkdir -p {shlex.quote(remote_parent)}"],
-            action="create the remote deployment directory",
+            [
+                self.ssh,
+                self.remote_host,
+                f"rm -rf {shlex.quote(remote_parent)} && mkdir -p {shlex.quote(remote_parent)}",
+            ],
+            action="replace the remote deployment directory",
         )
         self._run_checked(
             [self.scp, "-r", str(package_dir), f"{self.remote_host}:{remote_directory}"],

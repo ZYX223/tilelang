@@ -355,6 +355,64 @@ def test_torch_registration_source_targets_legacy_swtorch_api() -> None:
     assert "torch::jit::push(*stack, B);" in source
 
 
+@pytest.mark.parametrize("deployment_id", [".", ".."])
+def test_ssh_executor_rejects_dot_path_deployment_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deployment_id: str
+) -> None:
+    package_dir = tmp_path / "copy-package"
+    package_dir.mkdir()
+    calls = []
+
+    def fake_run(command, *, check, capture_output, text):
+        calls.append((command, check))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("tilelang.sunway.runtime.executor.subprocess.run", fake_run)
+    executor = SunwaySSHExecutor(
+        remote_host="root@10.10.10.22",
+        remote_root="/tmp/tilelang-runs",
+    )
+
+    with pytest.raises(ValueError, match="Unsafe Sunway deployment id"):
+        executor.deploy(package_dir, deployment_id=deployment_id)
+
+    assert calls == []
+
+
+def test_ssh_executor_replaces_existing_deployment_before_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_dir = tmp_path / "copy-package"
+    package_dir.mkdir()
+    calls = []
+
+    def fake_run(command, *, check, capture_output, text):
+        calls.append((command, check))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("tilelang.sunway.runtime.executor.subprocess.run", fake_run)
+    executor = SunwaySSHExecutor(
+        remote_host="root@10.10.10.22",
+        remote_root="/tmp/tilelang-runs",
+    )
+
+    executor.deploy(package_dir, deployment_id="reused-run")
+    executor.deploy(package_dir, deployment_id="reused-run")
+
+    prepare = [
+        "ssh",
+        "root@10.10.10.22",
+        "rm -rf /tmp/tilelang-runs/reused-run && mkdir -p /tmp/tilelang-runs/reused-run",
+    ]
+    copy = [
+        "scp",
+        "-r",
+        str(package_dir),
+        "root@10.10.10.22:/tmp/tilelang-runs/reused-run/package",
+    ]
+    assert calls == [(prepare, True), (copy, True), (prepare, True), (copy, True)]
+
+
 def test_ssh_executor_deploys_package_and_launches_swrun_on_9a(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -389,7 +447,12 @@ def test_ssh_executor_deploys_package_and_launches_swrun_on_9a(
     assert result.deployment.remote_directory == "/tmp/tilelang-runs/run-8421/package"
     assert calls == [
         (
-            ["ssh", "root@10.10.10.22", "mkdir -p /tmp/tilelang-runs/run-8421"],
+            [
+                "ssh",
+                "root@10.10.10.22",
+                "rm -rf /tmp/tilelang-runs/run-8421 && "
+                "mkdir -p /tmp/tilelang-runs/run-8421",
+            ],
             True,
         ),
         (
