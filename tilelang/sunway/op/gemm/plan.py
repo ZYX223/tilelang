@@ -1,4 +1,4 @@
-"""Static G0 plan extraction for canonical tiled GEMM programs."""
+"""Static schedule extraction for canonical tiled Sunway GEMM programs."""
 
 from __future__ import annotations
 
@@ -51,13 +51,25 @@ def _thread_loops(func: tirx.PrimFunc) -> dict[str, tirx.For]:
 
 
 @dataclass(frozen=True, slots=True)
-class SunwayScalarGemmPlan:
-    """Static tile, worker, pipeline, dtype, and LDM decisions for G0."""
+class SunwayGemmPlan:
+    """Static tile, mesh, compute, dtype, and LDM schedule decisions."""
 
     tile_m: int
     tile_n: int
     tile_k: int
+    block_tiles_m: int
+    block_tiles_n: int
+    k_panels: int
+    global_m: int
+    global_n: int
+    global_k: int
     workers: int
+    cpe_rows: int
+    cpe_cols: int
+    active_cpes: int
+    ownership: str
+    compute: str
+    vector_width: int
     stages: int
     input_dtype: str
     accum_dtype: str
@@ -68,7 +80,7 @@ class SunwayScalarGemmPlan:
         cls,
         func: tirx.PrimFunc,
         config: SunwayTargetConfig,
-    ) -> SunwayScalarGemmPlan:
+    ) -> SunwayGemmPlan:
         gemm_calls: list[tirx.Call] = []
 
         def collect_gemm(node: object) -> None:
@@ -110,9 +122,10 @@ class SunwayScalarGemmPlan:
         for tag in ("blockIdx.x", "blockIdx.y"):
             if tag not in bindings:
                 raise ValueError(f"Sunway G0 GEMM requires a {tag} tile binding")
-            _static_int(bindings[tag].extent, f"{tag} extent")
+        block_tiles_n = _static_int(bindings["blockIdx.x"].extent, "blockIdx.x extent")
+        block_tiles_m = _static_int(bindings["blockIdx.y"].extent, "blockIdx.y extent")
 
-        stage_values: list[int] = []
+        pipeline_values: list[tuple[int, int]] = []
 
         def collect_stages(node: object) -> None:
             if not isinstance(node, tirx.For) or "num_stages" not in node.annotations:
@@ -123,14 +136,33 @@ class SunwayScalarGemmPlan:
                 lambda child: names.append(_call_name(child)) if isinstance(child, tirx.Call) else None,
             )
             if "tl.tileop.gemm" in names:
-                stage_values.append(int(node.annotations["num_stages"]))
+                pipeline_values.append(
+                    (
+                        _static_int(node.extent, "GEMM K-panel count"),
+                        int(node.annotations["num_stages"]),
+                    )
+                )
 
         tirx.stmt_functor.post_order_visit(func.body, collect_stages)
-        if len(stage_values) != 1:
+        if len(pipeline_values) != 1:
             raise ValueError("Sunway G0 requires exactly one annotated GEMM pipeline loop")
-        stages = stage_values[0]
+        k_panels, stages = pipeline_values[0]
         if stages != 1:
             raise ValueError(f"Sunway G0 requires num_stages=1, got {stages}")
+
+        vector_width = config.simd_width if config.gemm_compute == "simd" else 1
+        if config.gemm_compute == "simd" and vector_width != 8:
+            raise ValueError(f"Sunway G1 requires SIMD width 8, got {vector_width}")
+        if tile_n % vector_width:
+            raise ValueError(
+                f"Sunway GEMM tile N {tile_n} is not divisible by vector width {vector_width}"
+            )
+
+        active_cpes = 1
+        if config.gemm_ownership == "mesh_2d":
+            active_cpes = min(block_tiles_m, config.cpe_rows) * min(
+                block_tiles_n, config.cpe_cols
+            )
 
         argument_count = sum(param in func.buffer_map for param in func.params)
         element_bytes = 4
@@ -149,7 +181,19 @@ class SunwayScalarGemmPlan:
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
+            block_tiles_m=block_tiles_m,
+            block_tiles_n=block_tiles_n,
+            k_panels=k_panels,
+            global_m=block_tiles_m * tile_m,
+            global_n=block_tiles_n * tile_n,
+            global_k=k_panels * tile_k,
             workers=workers,
+            cpe_rows=config.cpe_rows,
+            cpe_cols=config.cpe_cols,
+            active_cpes=active_cpes,
+            ownership=config.gemm_ownership,
+            compute=config.gemm_compute,
+            vector_width=vector_width,
             stages=stages,
             input_dtype=input_dtype,
             accum_dtype=accum_dtype,

@@ -8,7 +8,7 @@ from collections.abc import Callable
 import tilelang
 from tvm import IRModule, tirx
 
-from .op.gemm.plan import SunwayScalarGemmPlan
+from .op.gemm.plan import SunwayGemmPlan
 from .target import SunwayTargetConfig
 
 
@@ -152,7 +152,7 @@ def _offset_access_ptr(
 def expand_sunway_dma_2d(
     mod: IRModule,
     config: SunwayTargetConfig,
-    plan: SunwayScalarGemmPlan,
+    plan: SunwayGemmPlan,
 ) -> IRModule:
     """Expand each abstract 2D descriptor to an aligned row DMA and wait loop."""
 
@@ -325,7 +325,7 @@ def _restore_unit_block_dimensions(
 
 def attach_scalar_gemm_plan(
     mod: IRModule,
-    plan: SunwayScalarGemmPlan,
+    plan: SunwayGemmPlan,
     expected_block_tiles: tuple[int, int],
 ) -> IRModule:
     """Attach the S2 contract consumed by verification, codegen, and manifests."""
@@ -358,7 +358,7 @@ def lower_gemm_program_to_semantic_tir(mod: IRModule, config: SunwayTargetConfig
     """Lower one canonical tiled GEMM from S1 to inspectable semantic S2 TIR."""
 
     source_func = _only_prim_func(mod)
-    plan = SunwayScalarGemmPlan.from_prim_func(source_func, config)
+    plan = SunwayGemmPlan.from_prim_func(source_func, config)
     block_tiles = _bound_block_tile_extents(source_func)
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)

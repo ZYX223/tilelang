@@ -7,7 +7,12 @@ from tilelang import tvm
 from tilelang.backend.module import create_backend_context
 from tvm import IRModule, tirx
 
-from testing.python.sunway.gemm_cases import make_gemm_32, make_gemm_m32_n16_k32
+from testing.python.sunway.gemm_cases import (
+    make_gemm_32,
+    make_gemm_128_k64,
+    make_gemm_m32_n16_k32,
+)
+from tilelang.sunway.op.gemm.plan import SunwayGemmPlan
 from tilelang.sunway.gemm_transform import (
     lower_gemm_program_to_semantic_tir,
     lower_gemm_semantic_to_native_tir,
@@ -85,6 +90,36 @@ def _replace_first_extern(mod: IRModule, old_name: str, new_name: str) -> IRModu
 def _lower_s3(factory=make_gemm_32, config: SunwayTargetConfig | None = None) -> IRModule:
     config = config or SunwayTargetConfig()
     return lower_gemm_semantic_to_native_tir(_lower(factory, config), config)
+
+
+def test_g1_plan_records_mesh_multik_and_simd_schedule() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
+
+    plan = SunwayGemmPlan.from_prim_func(make_gemm_128_k64(), config)
+
+    assert plan.block_tiles_m == 8
+    assert plan.block_tiles_n == 8
+    assert plan.k_panels == 2
+    assert plan.global_m == 128
+    assert plan.global_n == 128
+    assert plan.global_k == 64
+    assert plan.cpe_rows == 8
+    assert plan.cpe_cols == 8
+    assert plan.active_cpes == 64
+    assert plan.ownership == "mesh_2d"
+    assert plan.compute == "simd"
+    assert plan.vector_width == 8
+
+
+def test_g1_plan_rejects_an_unsupported_simd_width() -> None:
+    config = SunwayTargetConfig(
+        gemm_ownership="mesh_2d",
+        gemm_compute="simd",
+        simd_width=4,
+    )
+
+    with pytest.raises(ValueError, match="requires SIMD width 8"):
+        SunwayGemmPlan.from_prim_func(make_gemm_128_k64(), config)
 
 
 @pytest.mark.parametrize(
