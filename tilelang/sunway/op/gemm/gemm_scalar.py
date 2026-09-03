@@ -5,6 +5,7 @@ from __future__ import annotations
 from tilelang import language as T
 from tilelang.tileop.gemm.gemm_base import GemmBase
 from tilelang.transform.simplify import _Simplify
+from tilelang.utils.language import is_fragment
 from tvm import tirx
 from tvm.ir import Range
 from tvm.target import Target
@@ -17,7 +18,21 @@ class GemmScalar(GemmBase):
     """Expand one GEMM tile to scalar TIR owned by logical CPE zero."""
 
     def infer_layout(self, target: Target, thread_nums: int):
-        return {}
+        del target, thread_nums
+        if not is_fragment(self.C):
+            return {}
+
+        shape = list(self.C.shape)
+        strides = [1 for _ in shape]
+        for index in range(len(shape) - 2, -1, -1):
+            strides[index] = strides[index + 1] * shape[index + 1]
+
+        def forward(*indices):
+            # G0 assigns the complete row-major accumulator tile to CPE zero.
+            flat_index = sum(index * stride for index, stride in zip(indices, strides, strict=True))
+            return 0, flat_index
+
+        return {self.C: T.Fragment(shape, forward_fn=forward)}
 
     def lower(
         self,
