@@ -249,6 +249,38 @@ def test_distributed_multik_gemm_example_keeps_official_frontend_and_reference()
     assert "gemm_128_k64 passed: M=128 N=128 K=64" in main
 
 
+def test_distributed_gemm_main_measures_seven_post_warmup_kernel_calls() -> None:
+    main = (
+        Path(__file__).parents[3] / "examples" / "sunway" / "gemm_128_k64_main.c"
+    ).read_text(encoding="utf-8")
+
+    assert "#include <time.h>" in main
+    assert "MEASURED_RUNS = 7" in main
+    assert "clock_gettime(CLOCK_MONOTONIC" in main
+    assert main.count("gemm_128_k64(A, B, C);") == 2
+    assert "sort_elapsed(elapsed_ms, MEASURED_RUNS);" in main
+    success = main.index("gemm_128_k64 passed: M=128 N=128 K=64")
+    timing = main.index("gemm_128_k64 median_ms: %.6f over %d runs")
+    assert success < timing
+
+
+def test_sunway_guide_records_g1_reproduction_and_scope() -> None:
+    guide = (Path(__file__).parents[3] / "docs" / "get_started" / "sunway.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(guide.split())
+
+    assert "## Distributed Multi-K SIMD GEMM G1" in guide
+    assert '--compute scalar' in guide
+    assert '--compute simd' in guide
+    assert '"gemm_ownership": "mesh_2d"' in guide
+    assert "gemm_128_k64 median_ms: 0.170961 over 7 runs" in guide
+    assert "gemm_128_k64 median_ms: 0.109881 over 7 runs" in guide
+    assert "synchronous DMA" in normalized
+    assert "does not implement double buffering" in normalized
+    assert "does not package a PyTorch operator" in normalized
+
+
 def test_library_generator_cross_compiles_boxed_torch_registration(tmp_path: Path) -> None:
     project_dir = tmp_path / "project"
     package_dir = tmp_path / "package"

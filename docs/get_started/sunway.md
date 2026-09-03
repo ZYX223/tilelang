@@ -168,6 +168,104 @@ gemm_m32_n16_k32 passed: M=32 N=16 K=32
 G0 deliberately assigns all output tiles to CPE 0 and uses scalar FP32
 multiply-add. It proves frontend compatibility, progressive lowering, generated
 MPE/CPE compilation, deployment, and numerical correctness. It is not a
-performance result. Later stages distribute ownership across 64 CPEs before
-adding SIMD, multi-K tiling, double buffering, mesh communication, and offline
-tuning.
+performance result. G1 below distributes ownership across 64 CPEs and adds
+multi-K tiling and SIMD; later stages add double buffering, mesh communication,
+and offline tuning.
+
+## Distributed Multi-K SIMD GEMM G1
+
+G1 keeps the same official TileLang frontend and selects the Sunway schedule
+through target configuration. The `gemm_128_k64` example uses an `8 x 8` output
+tile grid, `16 x 16 x 32` per-CPE tiles, and two K panels:
+
+```python
+target = {
+    "kind": "sunway",
+    "gemm_ownership": "mesh_2d",
+    "gemm_compute": "simd",
+    "output_dir": output_dir,
+    "output_indices": [2],
+}
+```
+
+`mesh_2d` maps one output tile to each of the 64 CPE coordinates. The scalar
+variant is an oracle for the same distributed and multi-K schedule. The SIMD
+variant rewrites only the inner compute region to the abstract S2
+`tilelang_sunway_fma_f32x8` leaf. S3 resolves it to
+`tilelang_sunway_native_fma_f32x8`, and structural C emission produces the
+verified `floatv8` and `simd_vmas` sequence.
+
+Generate both variants on the Dell build host:
+
+```bash
+cd /mnt/sda/zyx/project/tilelang-paper1-clean
+PY=/mnt/sda/zyx/envs/tilelang-sunway-paper1-clean/bin/python3
+
+$PY examples/sunway/gemm_128_k64.py \
+  --compute scalar \
+  --output-dir /tmp/tilelang-gemm-g1-scalar-generated-20260903
+$PY examples/sunway/gemm_128_k64.py \
+  --compute simd \
+  --output-dir /tmp/tilelang-gemm-g1-simd-generated-20260903
+```
+
+Inspect the three dumps before packaging. Both S2 files must report
+`sunway.ownership = "mesh_2d"` and `sunway.k_panels = 2`; their
+`sunway.compute` values distinguish scalar and SIMD. Only the SIMD S2/S3 pair
+contains the abstract/native FP32x8 leaves.
+
+Cross-compile both generated projects:
+
+```bash
+TOOLCHAIN=/mnt/sda/zyx/toolchains/swgcc710-tools-SEA-1307
+OVERLAY=/mnt/sda/zyx/toolchains/sw9a-sdk-overlay
+
+$PY examples/sunway/package_aot.py \
+  --generated-dir /tmp/tilelang-gemm-g1-scalar-generated-20260903 \
+  --package-dir /tmp/tilelang-gemm-g1-scalar-package-20260903 \
+  --toolchain-root $TOOLCHAIN --overlay-root $OVERLAY
+$PY examples/sunway/package_aot.py \
+  --generated-dir /tmp/tilelang-gemm-g1-simd-generated-20260903 \
+  --package-dir /tmp/tilelang-gemm-g1-simd-package-20260903 \
+  --toolchain-root $TOOLCHAIN --overlay-root $OVERLAY
+```
+
+Deploy the packages separately so their correctness and timing remain
+attributable:
+
+```bash
+$PY examples/sunway/run_aot.py \
+  --package-dir /tmp/tilelang-gemm-g1-scalar-package-20260903 \
+  --remote-host root@10.10.10.22 --remote-root /tmp/tilelang-runs \
+  --executable gemm_128_k64 --deployment-id gemm-g1-scalar-repeat-20260904
+$PY examples/sunway/run_aot.py \
+  --package-dir /tmp/tilelang-gemm-g1-simd-package-20260903 \
+  --remote-host root@10.10.10.22 --remote-root /tmp/tilelang-runs \
+  --executable gemm_128_k64 --deployment-id gemm-g1-simd-repeat-20260904
+```
+
+Both packages passed the same deterministic host reference on SW9A on
+2026-09-04. After one warmup, the standalone program measured seven in-process
+kernel calls and printed these median observations:
+
+```text
+# scalar
+gemm_128_k64 passed: M=128 N=128 K=64
+gemm_128_k64 median_ms: 0.170961 over 7 runs
+
+# SIMD
+gemm_128_k64 passed: M=128 N=128 K=64
+gemm_128_k64 median_ms: 0.109881 over 7 runs
+```
+
+These numbers include the MPE `athread_spawn` and `athread_join` cost but not
+SSH or `swrun` process startup. They are short-run observations, not a formal
+speedup claim. One transient `swrun` exit code 255 occurred before a successful
+rerun of the same SIMD binary, so longer repeated measurements are required for
+a performance result.
+
+G1 still uses private per-CPE buffers and synchronous DMA. It does not implement
+double buffering, row/column mesh communication, packed weights, tails, dynamic
+shapes, or mixed precision. This standalone G1 also does not package a PyTorch
+operator; the existing SWPyTorch AOT wrapper remains a separate integration
+path.
