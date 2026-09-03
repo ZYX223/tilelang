@@ -50,7 +50,7 @@ def annotate_sunway_tir(mod: IRModule) -> IRModule:
 
 def _call_name(call: tirx.Call) -> str | None:
     op_name = getattr(call.op, "name", None)
-    if op_name == "tl.tileop.copy":
+    if isinstance(op_name, str) and op_name.startswith("tl.tileop."):
         return op_name
     if op_name == "tirx.call_extern" and call.args and isinstance(call.args[0], tirx.StringImm):
         return call.args[0].value
@@ -281,8 +281,13 @@ def verify_semantic_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
         phase = "S2"
         if str(func.attrs.get("sunway.phase", "")) != phase:
             raise ValueError("Sunway S2 verifier received a function from another phase")
-        if str(func.attrs.get("sunway.kernel_kind", "")) != "copy":
-            raise ValueError("Sunway S2 verifier currently supports copy kernels only")
+        kernel_kind = str(func.attrs.get("sunway.kernel_kind", ""))
+        if kernel_kind == "gemm_scalar":
+            from .gemm_transform import _verify_gemm_semantic_func
+
+            return _verify_gemm_semantic_func(func, config)
+        if kernel_kind != "copy":
+            raise ValueError(f"Sunway S2 verifier does not support kernel kind {kernel_kind!r}")
 
         names = set(_named_calls(func))
         native = sorted(names & _NATIVE_CALLS)
