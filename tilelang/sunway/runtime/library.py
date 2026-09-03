@@ -49,6 +49,16 @@ class SunwayTorchSDK:
 
 
 @dataclass(frozen=True, slots=True)
+class SunwayPythonSDK:
+    """Headers and shared library for the Python installed on SW9A."""
+
+    include_root: Path
+    library_path: Path
+    runtime_home: str = "/usr/sw/swpython"
+    runtime_library_root: str = "/usr/sw/swpython/lib"
+
+
+@dataclass(frozen=True, slots=True)
 class SunwayArtifactPackage:
     """Paths produced by one LibraryGenerator invocation."""
 
@@ -57,6 +67,7 @@ class SunwayArtifactPackage:
     library_path: Path | None = None
     executable_path: Path | None = None
     torch_library_path: Path | None = None
+    python_launcher_path: Path | None = None
 
 
 class SunwayLibraryGenerator:
@@ -175,6 +186,91 @@ class SunwayLibraryGenerator:
             library_path=kernel_library,
             torch_library_path=torch_library,
         )
+
+    def compile_python_launcher(self, python_sdk: SunwayPythonSDK) -> SunwayArtifactPackage:
+        """Link Python and the generated CPE library into one SW9A AOT image.
+
+        SWGCC dynamic mode discovers CPE text from dependencies present when the
+        process starts. Loading a new mixed MPE/CPE library after startup leaves
+        its CPE text unmapped, so the launcher must retain the kernel library as
+        a DT_NEEDED dependency even though Python resolves its C ABI at runtime.
+        """
+
+        include_root = Path(python_sdk.include_root)
+        python_library = Path(python_sdk.library_path)
+        kernel_library = self.package_dir / f"lib{self.manifest.kernel_name}.so"
+        if not include_root.is_dir() or not python_library.is_file():
+            raise FileNotFoundError("Sunway Python SDK headers and shared library must exist")
+        if not kernel_library.is_file():
+            raise FileNotFoundError("compile_shared() must run before compile_python_launcher()")
+
+        source = self.package_dir / "swpython_launcher.c"
+        shutil.copy2(Path(__file__).with_name("swpython_launcher.c"), source)
+        launcher_object = self.package_dir / "swpython_launcher.o"
+        self._run(
+            "-mhost",
+            "-O2",
+            f"-I{include_root}",
+            "-c",
+            str(source),
+            "-o",
+            str(launcher_object),
+        )
+
+        launcher = self.package_dir / "tilelang_swpython"
+        self._run(
+            *self.toolchain.shared_link_flags,
+            *self._sysroot_link_flags(),
+            "-Wl,--dynamic-linker=/usr/sw/lib/ld-linux.so.2",
+            "-Wl,--export-dynamic",
+            "-Wl,--undefined=__crts_cg_shared",
+            "-Wl,--undefined=__crts_cg_proc",
+            str(launcher_object),
+            str(python_library),
+            "-Wl,--no-as-needed",
+            str(kernel_library),
+            "-Wl,--as-needed",
+            "-lpthread",
+            "-ldl",
+            "-lutil",
+            "-lm",
+            f"-Wl,-rpath,$ORIGIN:/usr/sw/lib:{python_sdk.runtime_library_root}",
+            "-o",
+            str(launcher),
+        )
+
+        packaged_manifest = SunwayKernelManifest.read(self.package_dir / "manifest.json")
+        artifacts = dict(packaged_manifest.artifacts)
+        artifacts.update(
+            {
+                "python_launcher": launcher.name,
+                "python_launcher_source": source.name,
+            }
+        )
+        packaged_manifest = replace(packaged_manifest, artifacts=artifacts)
+        manifest_path = self.package_dir / "manifest.json"
+        packaged_manifest.write(manifest_path)
+        torch_library_name = artifacts.get("torch_library")
+        torch_library = self.package_dir / torch_library_name if torch_library_name else None
+        return SunwayArtifactPackage(
+            self.package_dir,
+            manifest_path,
+            library_path=kernel_library,
+            torch_library_path=torch_library,
+            python_launcher_path=launcher,
+        )
+
+    def compile_torch_bundle(
+        self,
+        *,
+        torch_sdk: SunwayTorchSDK,
+        python_sdk: SunwayPythonSDK,
+    ) -> SunwayArtifactPackage:
+        """Build the kernel, torch.ops registration, and startup-linked Python."""
+
+        self.compile_shared()
+        self.compile_torch_extension(torch_sdk)
+        return self.compile_python_launcher(python_sdk)
 
     def _stage_sources(self, *, include_main: bool = False) -> dict[str, Path]:
         self.package_dir.mkdir(parents=True, exist_ok=True)

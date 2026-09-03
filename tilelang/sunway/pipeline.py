@@ -10,6 +10,8 @@ from .transform import (
     annotate_sunway_tir,
     lower_semantic_to_native_tir,
     lower_tile_copy_to_semantic_tir,
+    verify_native_tir,
+    verify_semantic_tir,
 )
 
 
@@ -29,9 +31,9 @@ def SunwayPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     s1 = annotate_sunway_tir(tirx.transform.BindTarget(target)(mod))
     _dump_checkpoint(s1, "s1_annotated_tir.txt", target)
 
-    s2 = lower_tile_copy_to_semantic_tir(s1, config)
+    s2 = verify_semantic_tir(lower_tile_copy_to_semantic_tir(s1, config), config)
     _dump_checkpoint(s2, "s2_semantic_tir.txt", target)
 
-    s3 = lower_semantic_to_native_tir(s2)
+    s3 = verify_native_tir(lower_semantic_to_native_tir(s2, config), config)
     _dump_checkpoint(s3, "s3_lowered_tir.txt", target)
     return s3

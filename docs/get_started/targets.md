@@ -18,6 +18,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
+| `sunway` | AOT MPE/CPE source generation for SW9A. See the [Sunway AOT workflow](sunway.md). |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
 

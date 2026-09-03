@@ -185,6 +185,25 @@ class _CPEEmitter:
             target = base if base == "reply" and indices == ["0"] else f"{base}[{']['.join(indices)}]"
             self.line(f"{target} = {self.emit_expr(stmt.value)};")
             return
+        if isinstance(stmt, tirx.For):
+            if stmt.kind != tirx.ForKind.SERIAL:
+                raise TypeError("Sunway CPE codegen currently supports serial TIR loops only")
+            loop_var = _c_identifier(stmt.loop_var.name)
+            start = self.emit_expr(stmt.min)
+            extent = self.emit_expr(stmt.extent)
+            stop = extent if start == "0" else f"({start} + {extent})"
+            if stmt.step is None or (
+                isinstance(stmt.step, tirx.IntImm) and int(stmt.step) == 1
+            ):
+                increment = f"++{loop_var}"
+            else:
+                increment = f"{loop_var} += {self.emit_expr(stmt.step)}"
+            self.line(f"for (int {loop_var} = {start}; {loop_var} < {stop}; {increment}) {{")
+            self.indent += 1
+            self.emit_stmt(stmt.body)
+            self.indent -= 1
+            self.line("}")
+            return
         if isinstance(stmt, tirx.IfThenElse):
             self.line(f"if ({self.emit_expr(stmt.condition)}) {{")
             self.indent += 1
@@ -232,6 +251,10 @@ class _CPEEmitter:
             return _c_identifier(expr.name)
         if isinstance(expr, tirx.Cast):
             return f"(({_c_type(expr.dtype)})({self.emit_expr(expr.value)}))"
+        if isinstance(expr, tirx.Min):
+            left = self.emit_expr(expr.a)
+            right = self.emit_expr(expr.b)
+            return f"(({left} < {right}) ? {left} : {right})"
         for node_type, operator in _BINARY_OPERATORS.items():
             if isinstance(expr, node_type):
                 return f"({self.emit_expr(expr.a)} {operator} {self.emit_expr(expr.b)})"
@@ -291,7 +314,7 @@ def _emit_mpe(kernel: _Kernel) -> str:
         f"void {kernel.name}({declarations}) {{\n"
         f"    {kernel.args_type} args;\n"
         f"{assignments}\n\n"
-        "    athread_init();\n"
+        "    /* swrun or the hybrid Python launcher owns CRTS initialization. */\n"
         f"    athread_spawn({kernel.cpe_entry}, &args);\n"
         "    athread_join();\n"
         "}\n"

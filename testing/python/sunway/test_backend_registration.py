@@ -53,6 +53,7 @@ def test_sunway_copy_lowers_to_aot_project(tmp_path) -> None:
     assert "athread_get" in s3
     assert "athread_put" in s3
     assert "copy_128_args_t" in header
+    assert "athread_init" not in mpe
     assert "athread_spawn" in mpe
     assert "athread_join" in mpe
     assert "_MYID" in cpe
@@ -60,3 +61,26 @@ def test_sunway_copy_lowers_to_aot_project(tmp_path) -> None:
     assert "athread_put" in cpe
     assert artifact.kernel_source == cpe
     assert [argument.role for argument in manifest.arguments] == ["input", "output"]
+
+
+def test_sunway_large_copy_emits_a_grid_stride_cpe_loop(tmp_path) -> None:
+    @T.prim_func
+    def copy_4096(A: T.Tensor((4096,), "float32"), B: T.Tensor((4096,), "float32")):
+        T.copy(A, B)
+
+    tilelang.lower(
+        copy_4096,
+        target={
+            "kind": "sunway",
+            "output_dir": str(tmp_path),
+            "output_indices": [1],
+            "ldm_bytes_per_cpe": 256,
+        },
+        runtime_only=True,
+    )
+
+    cpe = (tmp_path / "cpe_copy_4096.c").read_text()
+    assert "for (int tile_iteration = 0; tile_iteration < 2; ++tile_iteration)" in cpe
+    assert "tile_iteration * 64" in cpe
+    assert "< 74" in cpe
+    assert "?" in cpe

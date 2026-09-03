@@ -13,7 +13,8 @@ from tilelang.sunway.runtime import (
     SunwayKernelArgument,
     SunwayKernelManifest,
     SunwayLibraryGenerator,
-    SunwaySlurmRelayExecutor,
+    SunwayPythonSDK,
+    SunwaySSHExecutor,
     SunwayTorchSDK,
     SunwayTorchOperator,
     SunwayToolchain,
@@ -32,18 +33,6 @@ output = pathlib.Path(args[args.index("-o") + 1])
 output.write_text("fake artifact\\n", encoding="utf-8")
 with output.with_suffix(output.suffix + ".args").open("w", encoding="utf-8") as log:
     log.write("\\n".join(args))
-""",
-        encoding="utf-8",
-    )
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
-
-
-def _write_fake_scheduler(path: Path, output: str) -> Path:
-    path.write_text(
-        f"""#!/bin/sh
-printf '%s\\n' "$@" > "{path}.args"
-printf '%s\\n' "{output}"
 """,
         encoding="utf-8",
     )
@@ -184,6 +173,14 @@ def test_library_generator_can_emit_current_swrun_executable(tmp_path: Path) -> 
     assert str(package_dir / "copy_128_main.o") in link_args
 
 
+def test_standalone_copy_example_owns_crts_initialization() -> None:
+    example = Path(__file__).parents[3] / "examples" / "sunway" / "copy_128_main.c"
+    source = example.read_text(encoding="utf-8")
+
+    assert '#include "athread.h"' in source
+    assert source.count("athread_init();") == 1
+
+
 def test_library_generator_cross_compiles_boxed_torch_registration(tmp_path: Path) -> None:
     project_dir = tmp_path / "project"
     package_dir = tmp_path / "package"
@@ -215,6 +212,41 @@ def test_library_generator_cross_compiles_boxed_torch_registration(tmp_path: Pat
     assert "-lcopy_128" not in link_args
     packaged_manifest = SunwayKernelManifest.read(package.manifest_path)
     assert packaged_manifest.artifacts["torch_library"] == "tilelang_sunway_copy_128_ops.so"
+
+
+def test_library_generator_startup_links_python_and_cpe_bundle(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    package_dir = tmp_path / "package"
+    _write_copy_project(project_dir)
+    compiler = _write_fake_compiler(tmp_path / "fake-swgcc")
+    toolchain = SunwayToolchain(compiler=compiler, sysroot=tmp_path)
+    python_include = tmp_path / "python-include"
+    python_include.mkdir()
+    python_library = tmp_path / "libpython3.6m.so.1.0"
+    python_library.write_text("fake Python library\n", encoding="utf-8")
+    generator = SunwayLibraryGenerator(
+        project_dir=project_dir,
+        package_dir=package_dir,
+        manifest=_copy_manifest(),
+        toolchain=toolchain,
+    )
+    generator.compile_shared()
+
+    package = generator.compile_python_launcher(
+        SunwayPythonSDK(include_root=python_include, library_path=python_library)
+    )
+
+    assert package.python_launcher_path == package_dir / "tilelang_swpython"
+    assert package.python_launcher_path.is_file()
+    assert (package_dir / "swpython_launcher.c").is_file()
+    link_args = (package_dir / "tilelang_swpython.args").read_text().splitlines()
+    assert "-mdynamic" in link_args
+    assert "-mhybrid" not in link_args
+    assert "-Wl,--no-as-needed" in link_args
+    assert str(package_dir / "libcopy_128.so") in link_args
+    assert "-Wl,-rpath,$ORIGIN:/usr/sw/lib:/usr/sw/swpython/lib" in link_args
+    packaged_manifest = SunwayKernelManifest.read(package.manifest_path)
+    assert packaged_manifest.artifacts["python_launcher"] == "tilelang_swpython"
 
 
 def test_kernel_adapter_invokes_pointer_abi_from_manifest(tmp_path: Path) -> None:
@@ -323,48 +355,127 @@ def test_torch_registration_source_targets_legacy_swtorch_api() -> None:
     assert "torch::jit::push(*stack, B);" in source
 
 
-def test_slurm_relay_submits_dell_job_that_launches_swrun_on_9a(tmp_path: Path) -> None:
+def test_ssh_executor_deploys_package_and_launches_swrun_on_9a(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     package_dir = tmp_path / "copy-package"
     package_dir.mkdir()
     executable = package_dir / "copy_128"
     executable.write_text("fake executable\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     _copy_manifest().write(package_dir / "manifest.json")
-    sbatch = _write_fake_scheduler(tmp_path / "sbatch", "8421")
+    calls = []
 
-    job = SunwaySlurmRelayExecutor(
+    def fake_run(command, *, check, capture_output, text):
+        calls.append((command, check))
+        if command[0] == "ssh" and "swrun" in command[-1]:
+            return subprocess.CompletedProcess(command, 0, "copy_128 passed: 128 elements\n", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("tilelang.sunway.runtime.executor.subprocess.run", fake_run)
+    executor = SunwaySSHExecutor(
         remote_host="root@10.10.10.22",
-        remote_root="/tmp/tilelang-jobs",
-        partition="q_dell",
-        account="sunway-project",
-        sbatch=sbatch,
-    ).submit(package_dir, executable="copy_128")
+        remote_root="/tmp/tilelang-runs",
+    )
 
-    assert job.scheduler_job_id == "8421"
-    assert job.submit_script.is_file()
-    script = job.submit_script.read_text(encoding="utf-8")
-    assert "scp" in script
-    assert "copy-package/." not in script
-    assert '"$REMOTE_DIR/package"' in script
-    assert "root@10.10.10.22" in script
-    assert "swrun -E 64 -i ./copy_128" in script
-    submit_args = Path(f"{sbatch}.args").read_text(encoding="utf-8").splitlines()
-    assert submit_args[:6] == [
-        "--parsable",
-        "--partition",
-        "q_dell",
-        "--account",
-        "sunway-project",
-        "--job-name",
+    result = executor.deploy_and_run(
+        package_dir,
+        executable="copy_128",
+        deployment_id="run-8421",
+    )
+
+    assert result.succeeded
+    assert result.stdout == "copy_128 passed: 128 elements\n"
+    assert result.deployment.remote_directory == "/tmp/tilelang-runs/run-8421/package"
+    assert calls == [
+        (
+            ["ssh", "root@10.10.10.22", "mkdir -p /tmp/tilelang-runs/run-8421"],
+            True,
+        ),
+        (
+            [
+                "scp",
+                "-r",
+                str(package_dir),
+                "root@10.10.10.22:/tmp/tilelang-runs/run-8421/package",
+            ],
+            True,
+        ),
+        (
+            [
+                "ssh",
+                "root@10.10.10.22",
+                "cd /tmp/tilelang-runs/run-8421/package && chmod +x ./copy_128 && "
+                "swrun -E 64 -i ./copy_128",
+            ],
+            False,
+        ),
     ]
 
 
-def test_slurm_relay_reads_active_job_state(tmp_path: Path) -> None:
-    squeue = _write_fake_scheduler(tmp_path / "squeue", "RUNNING")
-    executor = SunwaySlurmRelayExecutor(
+def test_ssh_executor_returns_remote_kernel_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_dir = tmp_path / "copy-package"
+    package_dir.mkdir()
+    executable = package_dir / "copy_128"
+    executable.write_text("fake executable\n", encoding="utf-8")
+
+    def fake_run(command, *, check, capture_output, text):
+        if command[0] == "ssh" and "swrun" in command[-1]:
+            return subprocess.CompletedProcess(command, 7, "", "kernel failed\n")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("tilelang.sunway.runtime.executor.subprocess.run", fake_run)
+    executor = SunwaySSHExecutor(
         remote_host="root@10.10.10.22",
-        remote_root="/tmp/tilelang-jobs",
-        squeue=squeue,
+        remote_root="/tmp/tilelang-runs",
     )
 
-    assert executor.status("8421") == "RUNNING"
+    result = executor.deploy_and_run(
+        package_dir,
+        executable="copy_128",
+        deployment_id="failed-run",
+    )
+
+    assert not result.succeeded
+    assert result.returncode == 7
+    assert result.stderr == "kernel failed\n"
+
+
+def test_ssh_executor_runs_startup_linked_python_without_swrun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_dir = tmp_path / "copy-package"
+    package_dir.mkdir()
+    (package_dir / "tilelang_swpython").write_text("fake launcher\n", encoding="utf-8")
+    (package_dir / "run_copy.py").write_text("print('copy passed')\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, *, check, capture_output, text):
+        calls.append((command, check))
+        if command[0] == "ssh" and "./tilelang_swpython ./run_copy.py" in command[-1]:
+            return subprocess.CompletedProcess(command, 0, "copy passed\n", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("tilelang.sunway.runtime.executor.subprocess.run", fake_run)
+    executor = SunwaySSHExecutor(
+        remote_host="root@10.10.10.22",
+        remote_root="/tmp/tilelang-runs",
+    )
+
+    result = executor.deploy_and_run_python(
+        package_dir,
+        launcher="tilelang_swpython",
+        script="run_copy.py",
+        deployment_id="python-run",
+    )
+
+    assert result.succeeded
+    assert result.stdout == "copy passed\n"
+    remote_command = calls[-1][0][-1]
+    assert ". /usr/sw/swpython/setenv" in remote_command
+    assert "PYTHONHOME=/usr/sw/swpython" in remote_command
+    assert "STASK_SEG_DATA=64" in remote_command
+    assert "./tilelang_swpython ./run_copy.py" in remote_command
+    assert "swrun" not in remote_command

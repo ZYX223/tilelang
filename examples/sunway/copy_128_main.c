@@ -1,5 +1,7 @@
 #include <stdio.h>
 
+#include "athread.h"
+
 void copy_128(float *A, float *B);
 
 static float input[128];
@@ -12,6 +14,8 @@ int main(void) {
         output[i] = -1.0f;
     }
 
+    /* A standalone -mhybrid executable owns CRTS initialization. */
+    athread_init();
     copy_128(input, output);
 
     for (i = 0; i < 128; ++i) {

@@ -1,8 +1,14 @@
 """Build- and run-time helpers for generated Sunway kernels."""
 
 from .adapter import SunwayKernelAdapter
-from .executor import SunwaySlurmRelayExecutor, SunwaySubmittedJob
-from .library import SunwayArtifactPackage, SunwayLibraryGenerator, SunwayToolchain, SunwayTorchSDK
+from .executor import SunwayDeployment, SunwayExecutionResult, SunwaySSHExecutor
+from .library import (
+    SunwayArtifactPackage,
+    SunwayLibraryGenerator,
+    SunwayPythonSDK,
+    SunwayToolchain,
+    SunwayTorchSDK,
+)
 from .manifest import SunwayKernelArgument, SunwayKernelManifest
 from .torch_wrapper import SunwayTorchOperator, render_torch_registration_source
 
@@ -12,8 +18,10 @@ __all__ = [
     "SunwayKernelArgument",
     "SunwayKernelManifest",
     "SunwayLibraryGenerator",
-    "SunwaySlurmRelayExecutor",
-    "SunwaySubmittedJob",
+    "SunwayPythonSDK",
+    "SunwayDeployment",
+    "SunwayExecutionResult",
+    "SunwaySSHExecutor",
     "SunwayTorchOperator",
     "SunwayToolchain",
     "SunwayTorchSDK",

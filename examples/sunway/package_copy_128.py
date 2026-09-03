@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 from tilelang.sunway.runtime import (
     SunwayKernelManifest,
     SunwayLibraryGenerator,
+    SunwayPythonSDK,
     SunwayToolchain,
     SunwayTorchSDK,
 )
@@ -42,14 +44,18 @@ def main() -> None:
 
     if args.swtorch_sdk_root is None:
         parser.error("--swtorch-sdk-root is required for --artifact torch")
-    generator.compile_shared()
-    package = generator.compile_torch_extension(
-        SunwayTorchSDK(
+    package = generator.compile_torch_bundle(
+        torch_sdk=SunwayTorchSDK(
             include_root=args.swtorch_sdk_root / "torch" / "include",
             library_root=args.swtorch_sdk_root / "torch" / "lib",
-        )
+        ),
+        python_sdk=SunwayPythonSDK(
+            include_root=args.swtorch_sdk_root / "python" / "include" / "python3.6m",
+            library_path=args.swtorch_sdk_root / "python" / "lib" / "libpython3.6m.so.1.0",
+        ),
     )
-    print(package.torch_library_path)
+    shutil.copy2(Path(__file__).with_name("run_copy_128_torch.py"), args.package_dir)
+    print(package.python_launcher_path)
 
 
 if __name__ == "__main__":
