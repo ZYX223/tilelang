@@ -181,6 +181,44 @@ def test_standalone_copy_example_owns_crts_initialization() -> None:
     assert source.count("athread_init();") == 1
 
 
+@pytest.mark.parametrize(
+    ("filename", "signature", "success_line"),
+    [
+        (
+            "gemm_32_main.c",
+            "void gemm_32(float *A, float *B, float *C);",
+            "gemm_32 passed: M=32 N=32 K=32",
+        ),
+        (
+            "gemm_m32_n16_k32_main.c",
+            "void gemm_m32_n16_k32(float *A, float *B, float *C);",
+            "gemm_m32_n16_k32 passed: M=32 N=16 K=32",
+        ),
+    ],
+)
+def test_standalone_gemm_examples_own_one_crts_initialization(
+    filename: str,
+    signature: str,
+    success_line: str,
+) -> None:
+    example = Path(__file__).parents[3] / "examples" / "sunway" / filename
+    source = example.read_text(encoding="utf-8")
+
+    assert source.count("athread_init();") == 1
+    assert signature in source
+    assert success_line in source
+
+
+def test_generic_aot_scripts_do_not_name_a_kernel() -> None:
+    example_dir = Path(__file__).parents[3] / "examples" / "sunway"
+    package_source = (example_dir / "package_aot.py").read_text(encoding="utf-8")
+    run_source = (example_dir / "run_aot.py").read_text(encoding="utf-8")
+
+    for name in ("copy_128", "gemm_32", "gemm_m32_n16_k32"):
+        assert name not in package_source
+        assert name not in run_source
+
+
 def test_library_generator_cross_compiles_boxed_torch_registration(tmp_path: Path) -> None:
     project_dir = tmp_path / "project"
     package_dir = tmp_path / "package"
