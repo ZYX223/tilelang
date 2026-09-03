@@ -1,4 +1,4 @@
-"""Static schedule analysis shared by Sunway semantic lowering passes."""
+"""Static ownership and LDM planning for Sunway copy operations."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from tvm import tirx
 
-from .target import SunwayTargetConfig
+from ...target import SunwayTargetConfig
 
 
 _SW64_POINTER_BYTES = 8

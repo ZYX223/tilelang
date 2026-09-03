@@ -14,11 +14,13 @@ from testing.python.sunway.gemm_cases import (
     make_gemm_m32_n16_k32,
 )
 from tilelang.sunway.op.gemm.plan import SunwayGemmPlan
-from tilelang.sunway.gemm_transform import (
+from tilelang.sunway.op.gemm.lower import (
     lower_gemm_program_to_semantic_tir,
     lower_gemm_semantic_to_native_tir,
-    verify_gemm_semantic_tir,
+)
+from tilelang.sunway.op.gemm.verify import (
     verify_gemm_native_tir,
+    verify_gemm_semantic_tir,
 )
 from tilelang.sunway.target import SunwayTargetConfig
 from tilelang.sunway.transform import annotate_sunway_tir

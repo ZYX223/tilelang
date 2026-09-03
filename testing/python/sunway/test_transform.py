@@ -6,12 +6,11 @@ import tilelang.language as T
 import tvm
 from tvm import IRModule, tirx
 
-from tilelang.sunway.analysis import analyze_copy
+from tilelang.sunway.op.copy import analyze_copy, lower_tile_copy_to_semantic_tir
 from tilelang.sunway.target import SunwayTargetConfig
 from tilelang.sunway.transform import (
     annotate_sunway_tir,
     lower_semantic_to_native_tir,
-    lower_tile_copy_to_semantic_tir,
     verify_native_tir,
     verify_semantic_tir,
 )

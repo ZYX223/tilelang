@@ -6,28 +6,13 @@ from tvm import IRModule, tirx
 from tvm.target import Target
 
 from .target import get_sunway_target_config
-from .gemm_transform import lower_gemm_program_to_semantic_tir
 from .transform import (
     annotate_sunway_tir,
     lower_semantic_to_native_tir,
-    lower_tile_copy_to_semantic_tir,
     verify_native_tir,
     verify_semantic_tir,
 )
-
-
-def _contains_tile_op(mod: IRModule, name: str) -> bool:
-    found = False
-
-    def visit(node: object) -> None:
-        nonlocal found
-        if isinstance(node, tirx.Call) and str(getattr(node.op, "name", "")) == name:
-            found = True
-
-    for func in mod.functions.values():
-        if isinstance(func, tirx.PrimFunc):
-            tirx.stmt_functor.post_order_visit(func.body, visit)
-    return found
+from .op import lower_program_to_semantic_tir
 
 
 def _dump_checkpoint(mod: IRModule, filename: str, target: Target) -> None:
@@ -46,10 +31,7 @@ def SunwayPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     s1 = annotate_sunway_tir(tirx.transform.BindTarget(target)(mod))
     _dump_checkpoint(s1, "s1_annotated_tir.txt", target)
 
-    if _contains_tile_op(s1, "tl.tileop.gemm"):
-        s2 = lower_gemm_program_to_semantic_tir(s1, config)
-    else:
-        s2 = lower_tile_copy_to_semantic_tir(s1, config)
+    s2 = lower_program_to_semantic_tir(s1, config)
     s2 = verify_semantic_tir(s2, config)
     _dump_checkpoint(s2, "s2_semantic_tir.txt", target)
 

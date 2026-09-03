@@ -220,8 +220,9 @@ def test_generic_aot_scripts_do_not_name_a_kernel() -> None:
 
 
 def test_sunway_codegen_selects_simd_from_the_native_leaf_not_a_kernel_name() -> None:
-    source = (Path(__file__).parents[3] / "tilelang" / "sunway" / "codegen.py").read_text(
-        encoding="utf-8"
+    codegen_dir = Path(__file__).parents[3] / "tilelang" / "sunway" / "codegen"
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(codegen_dir.glob("*.py"))
     )
 
     assert "tilelang_sunway_native_fma_f32x8" in source
