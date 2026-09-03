@@ -15,6 +15,8 @@ from tilelang.backend.target import TargetLike, register_target_normalizer
 
 SUNWAY_TARGET_KEY = "sunway"
 _CONFIG_TAG_PREFIX = "tilelang-sunway-v1-"
+_GEMM_OWNERSHIP_MODES = frozenset({"single", "mesh_2d"})
+_GEMM_COMPUTE_MODES = frozenset({"scalar", "simd"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +29,16 @@ class SunwayTargetConfig:
     ldm_bytes_per_cpe: int = 64 * 1024
     dma_alignment: int = 16
     simd_width: int = 8
+    gemm_ownership: str = "single"
+    gemm_compute: str = "scalar"
     output_dir: Path | None = None
     output_indices: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.gemm_ownership not in _GEMM_OWNERSHIP_MODES:
+            raise ValueError(f"unsupported Sunway gemm_ownership {self.gemm_ownership!r}")
+        if self.gemm_compute not in _GEMM_COMPUTE_MODES:
+            raise ValueError(f"unsupported Sunway gemm_compute {self.gemm_compute!r}")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, object]) -> SunwayTargetConfig:
@@ -41,6 +51,8 @@ class SunwayTargetConfig:
             ldm_bytes_per_cpe=int(values.get("ldm_bytes_per_cpe", defaults.ldm_bytes_per_cpe)),
             dma_alignment=int(values.get("dma_alignment", defaults.dma_alignment)),
             simd_width=int(values.get("simd_width", defaults.simd_width)),
+            gemm_ownership=str(values.get("gemm_ownership", defaults.gemm_ownership)),
+            gemm_compute=str(values.get("gemm_compute", defaults.gemm_compute)),
             output_dir=Path(str(output_dir)).expanduser() if output_dir is not None else None,
             output_indices=tuple(int(index) for index in values.get("output_indices", defaults.output_indices)),
         )
@@ -53,6 +65,8 @@ class SunwayTargetConfig:
             "ldm_bytes_per_cpe": self.ldm_bytes_per_cpe,
             "dma_alignment": self.dma_alignment,
             "simd_width": self.simd_width,
+            "gemm_ownership": self.gemm_ownership,
+            "gemm_compute": self.gemm_compute,
             "output_dir": str(self.output_dir) if self.output_dir is not None else None,
             "output_indices": list(self.output_indices),
         }
