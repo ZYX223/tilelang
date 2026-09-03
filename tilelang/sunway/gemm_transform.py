@@ -18,6 +18,14 @@ _DMA_2D_CALLS = {
 }
 _DMA_CALLS = frozenset(_DMA_2D_CALLS.values())
 _NATIVE_CALLS = frozenset({"_MYID", "athread_get", "athread_put", "tilelang_sunway_reply_wait"})
+_SEMANTIC_CALLS = frozenset(
+    {
+        "tilelang_sunway_pe_id",
+        "tilelang_sunway_dma_get",
+        "tilelang_sunway_dma_put",
+        "tilelang_sunway_dma_wait",
+    }
+)
 
 
 def _map_prim_funcs(mod: IRModule, rewrite: Callable[[tirx.PrimFunc], tirx.PrimFunc]) -> IRModule:
@@ -497,3 +505,144 @@ def verify_gemm_semantic_tir(mod: IRModule, config: SunwayTargetConfig) -> IRMod
     """Verify that semantic S2 completely owns the scalar GEMM schedule."""
 
     return _map_prim_funcs(mod, lambda func: _verify_gemm_semantic_func(func, config))
+
+
+def _is_static_compact(buffer: tirx.Buffer) -> bool:
+    if not buffer.shape or any(not isinstance(extent, tirx.IntImm) or int(extent) <= 0 for extent in buffer.shape):
+        return False
+    if not buffer.strides:
+        return True
+    if len(buffer.strides) != len(buffer.shape) or any(not isinstance(stride, tirx.IntImm) for stride in buffer.strides):
+        return False
+    expected = 1
+    for extent, stride in zip(reversed(buffer.shape), reversed(buffer.strides), strict=True):
+        if int(stride) != expected:
+            return False
+        expected *= int(extent)
+    return True
+
+
+def _verify_gemm_native_func(func: tirx.PrimFunc, config: SunwayTargetConfig) -> tirx.PrimFunc:
+    if str(func.attrs.get("sunway.phase", "")) != "S3":
+        raise ValueError("Sunway S3 GEMM verifier received a function from another phase")
+    if str(func.attrs.get("sunway.kernel_kind", "")) != "gemm_scalar":
+        raise ValueError("Sunway S3 GEMM verifier received another kernel kind")
+
+    metadata = {
+        key: _required_positive_attr(func, key)
+        for key in (
+            "sunway.cpe_count",
+            "sunway.active_cpes",
+            "sunway.block_tiles_m",
+            "sunway.block_tiles_n",
+            "sunway.tile_m",
+            "sunway.tile_n",
+            "sunway.tile_k",
+            "sunway.pipeline_stages",
+            "sunway.ldm_bytes",
+        )
+    }
+    expected_workers = config.cpe_rows * config.cpe_cols
+    if metadata["sunway.cpe_count"] != expected_workers or metadata["sunway.active_cpes"] != 1:
+        raise ValueError("Sunway S3 GEMM invariant failed: invalid G0 CPE ownership metadata")
+    if metadata["sunway.pipeline_stages"] != 1:
+        raise ValueError("Sunway S3 GEMM invariant failed: G0 requires one pipeline stage")
+    if metadata["sunway.ldm_bytes"] > config.ldm_bytes_per_cpe:
+        raise ValueError(
+            f"Sunway S3 GEMM invariant failed: LDM plan uses {metadata['sunway.ldm_bytes']} bytes, "
+            f"but target limit is {config.ldm_bytes_per_cpe}"
+        )
+
+    names = _named_calls(func.body)
+    counts = Counter(names)
+    semantic = sorted(set(names) & _SEMANTIC_CALLS)
+    if semantic:
+        raise ValueError(f"Sunway S3 GEMM invariant failed: semantic call {semantic[0]!r} remains")
+    tile_ops = sorted(name for name in set(names) if name.startswith("tl.tileop."))
+    if tile_ops:
+        raise ValueError(f"Sunway S3 GEMM invariant failed: residual TileOp {tile_ops[0]!r}")
+    expected_calls = {
+        "_MYID": 1,
+        "athread_get": 2,
+        "athread_put": 1,
+        "tilelang_sunway_reply_wait": 3,
+    }
+    for name, expected in expected_calls.items():
+        if counts[name] != expected:
+            raise ValueError(
+                f"Sunway S3 GEMM invariant failed: expected {expected} {name} call(s), found {counts[name]}"
+            )
+
+    loops: list[tirx.For] = []
+    allocated: list[tirx.Buffer] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, tirx.For):
+            loops.append(node)
+        elif isinstance(node, tirx.AllocBuffer):
+            allocated.append(node.buffer)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    if any(loop.thread_binding is not None for loop in loops):
+        raise ValueError("Sunway S3 GEMM invariant failed: thread binding remains")
+    buffers = [*func.buffer_map.values(), *allocated]
+    if not buffers or any(not _is_static_compact(buffer) for buffer in buffers):
+        raise ValueError("Sunway S3 GEMM invariant failed: expected statically shaped compact buffers")
+
+    float_multiply = False
+    float_add = False
+    has_load = False
+    has_store = False
+
+    def visit_arithmetic(node: object) -> None:
+        nonlocal float_multiply, float_add, has_load, has_store
+        if isinstance(node, tirx.Mul) and str(node.dtype) == "float32":
+            float_multiply = True
+        elif isinstance(node, tirx.Add) and str(node.dtype) == "float32":
+            float_add = True
+        elif isinstance(node, tirx.BufferLoad):
+            has_load = True
+        elif isinstance(node, tirx.BufferStore):
+            has_store = True
+
+    tirx.stmt_functor.post_order_visit(func.body, visit_arithmetic)
+    if not (float_multiply and float_add and has_load and has_store):
+        raise ValueError("Sunway S3 GEMM invariant failed: scalar FP32 multiply/add is missing")
+
+    block_loops = {loop.loop_var.name: loop for loop in loops if loop.loop_var.name in {"bx", "by"}}
+    if set(block_loops) != {"bx", "by"} or any(
+        loop.kind != tirx.ForKind.SERIAL for loop in block_loops.values()
+    ):
+        raise ValueError("Sunway S3 GEMM invariant failed: block tiles must remain static serial loops")
+    dma_row_loops = [loop for loop in loops if loop.loop_var.name.startswith("sunway_dma_row_")]
+    if len(dma_row_loops) != 3:
+        raise ValueError("Sunway S3 GEMM invariant failed: expected three native row-transfer loops")
+    for loop in dma_row_loops:
+        row_names = _named_calls(loop.body)
+        issues = [name for name in row_names if name in {"athread_get", "athread_put"}]
+        waits = [name for name in row_names if name == "tilelang_sunway_reply_wait"]
+        if len(issues) != 1 or len(waits) != 1 or row_names.index(issues[0]) > row_names.index(waits[0]):
+            raise ValueError("Sunway S3 GEMM invariant failed: native DMA issue/wait ordering is invalid")
+    return func
+
+
+def verify_gemm_native_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
+    """Verify codegen-ready G0 TIR after resolving target ABI leaves."""
+
+    return _map_prim_funcs(mod, lambda func: _verify_gemm_native_func(func, config))
+
+
+def lower_gemm_semantic_to_native_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
+    """Resolve semantic leaves and prepare scalar GEMM TIR for mechanical C emission."""
+
+    verify_gemm_semantic_tir(mod, config)
+    from .transform import _lower_semantic_calls_to_native
+
+    block_tiles_m = int(_only_prim_func(mod).attrs["sunway.block_tiles_m"])
+    block_tiles_n = int(_only_prim_func(mod).attrs["sunway.block_tiles_n"])
+    mod = _lower_semantic_calls_to_native(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tirx.transform.Simplify()(mod)
+    mod = tirx.transform.RemoveNoOp()(mod)
+    mod = _restore_unit_block_dimensions(mod, block_tiles_m, block_tiles_n)
+    return verify_gemm_native_tir(mod, config)

@@ -10,7 +10,9 @@ from tvm import IRModule, tirx
 from testing.python.sunway.gemm_cases import make_gemm_32, make_gemm_m32_n16_k32
 from tilelang.sunway.gemm_transform import (
     lower_gemm_program_to_semantic_tir,
+    lower_gemm_semantic_to_native_tir,
     verify_gemm_semantic_tir,
+    verify_gemm_native_tir,
 )
 from tilelang.sunway.target import SunwayTargetConfig
 from tilelang.sunway.transform import annotate_sunway_tir
@@ -78,6 +80,11 @@ def _replace_first_extern(mod: IRModule, old_name: str, new_name: str) -> IRModu
     result = _rewrite_body(mod, rewrite)
     assert replaced
     return result
+
+
+def _lower_s3(factory=make_gemm_32, config: SunwayTargetConfig | None = None) -> IRModule:
+    config = config or SunwayTargetConfig()
+    return lower_gemm_semantic_to_native_tir(_lower(factory, config), config)
 
 
 @pytest.mark.parametrize(
@@ -210,3 +217,96 @@ def test_s2_verifier_rejects_a_non_serial_block_loop() -> None:
     assert replaced
     with pytest.raises(ValueError, match="block tiles must be static serial"):
         verify_gemm_semantic_tir(invalid, SunwayTargetConfig())
+
+
+@pytest.mark.parametrize("factory", [make_gemm_32, make_gemm_m32_n16_k32])
+def test_s3_resolves_native_leaves_and_preserves_static_buffers(factory) -> None:
+    func = _only_prim_func(_lower_s3(factory))
+    names = _call_names(func.body)
+    counts = Counter(names)
+    allocated: list[tirx.Buffer] = []
+    tirx.stmt_functor.post_order_visit(
+        func.body,
+        lambda node: allocated.append(node.buffer) if isinstance(node, tirx.AllocBuffer) else None,
+    )
+
+    assert str(func.attrs["sunway.phase"]) == "S3"
+    assert counts["tilelang_sunway_dma_get"] == 0
+    assert counts["tilelang_sunway_dma_put"] == 0
+    assert counts["tilelang_sunway_dma_wait"] == 0
+    assert counts["athread_get"] == 2
+    assert counts["athread_put"] == 1
+    assert counts["tilelang_sunway_reply_wait"] == 3
+    assert allocated
+    assert all(all(isinstance(dim, tirx.IntImm) for dim in buffer.shape) for buffer in allocated)
+
+
+def test_s3_verifier_rejects_a_residual_semantic_call() -> None:
+    s3 = _lower_s3()
+    invalid = _replace_first_extern(s3, "athread_get", "tilelang_sunway_dma_get")
+
+    with pytest.raises(ValueError, match="semantic call.*tilelang_sunway_dma_get"):
+        verify_gemm_native_tir(invalid, SunwayTargetConfig())
+
+
+def test_s3_verifier_rejects_a_residual_thread_binding() -> None:
+    s3 = _lower_s3()
+    replaced = False
+
+    def rewrite(node: object) -> object | None:
+        nonlocal replaced
+        if replaced or not isinstance(node, tirx.For) or node.loop_var.name != "bx":
+            return None
+        replaced = True
+        thread_binding = tirx.IterVar(
+            tvm.ir.Range(node.min, node.extent),
+            node.loop_var,
+            tirx.IterVar.ThreadIndex,
+            "blockIdx.x",
+        )
+        return tirx.For(
+            node.loop_var,
+            node.min,
+            node.extent,
+            tirx.ForKind.THREAD_BINDING,
+            node.body,
+            thread_binding=thread_binding,
+            annotations=node.annotations,
+            step=node.step,
+        )
+
+    invalid = _rewrite_body(s3, rewrite)
+    assert replaced
+    with pytest.raises(ValueError, match="thread binding remains"):
+        verify_gemm_native_tir(invalid, SunwayTargetConfig())
+
+
+def test_s3_verifier_rejects_a_symbolic_allocated_buffer() -> None:
+    s3 = _lower_s3()
+    func = _only_prim_func(s3)
+    symbolic = tirx.decl_buffer((tirx.Var("symbolic_extent", "int32"),), "float32", name="symboliclk")
+    invalid = IRModule({"main": func.with_body(tirx.SeqStmt([tirx.AllocBuffer(symbolic), func.body]))})
+
+    with pytest.raises(ValueError, match="statically shaped compact buffers"):
+        verify_gemm_native_tir(invalid, SunwayTargetConfig())
+
+
+def test_s3_verifier_rejects_missing_scalar_multiply() -> None:
+    s3 = _lower_s3()
+
+    def rewrite(node: object) -> object | None:
+        if isinstance(node, tirx.Mul) and str(node.dtype) == "float32":
+            return node.a
+        return None
+
+    invalid = _rewrite_body(s3, rewrite)
+    with pytest.raises(ValueError, match="scalar FP32 multiply/add"):
+        verify_gemm_native_tir(invalid, SunwayTargetConfig())
+
+
+def test_s3_verifier_rejects_ldm_metadata_above_budget() -> None:
+    s3 = _lower_s3()
+    func = _only_prim_func(s3).with_attr("sunway.ldm_bytes", 64 * 1024 + 1)
+
+    with pytest.raises(ValueError, match="LDM plan uses 65537 bytes.*limit is 65536"):
+        verify_gemm_native_tir(IRModule({"main": func}), SunwayTargetConfig())

@@ -323,6 +323,14 @@ def _lower_semantic_call(node: object) -> object | None:
     return tirx.call_extern(node.dtype, native_name, *node.args[1:])
 
 
+def _lower_semantic_calls_to_native(mod: IRModule) -> IRModule:
+    def rewrite(func: tirx.PrimFunc) -> tirx.PrimFunc:
+        body = tirx.stmt_functor.ir_transform(func.body, None, _lower_semantic_call)
+        return func.with_body(body).with_attr("sunway.phase", "S3")
+
+    return _map_prim_funcs(mod, rewrite)
+
+
 def lower_semantic_to_native_tir(
     mod: IRModule,
     config: SunwayTargetConfig,
@@ -330,12 +338,18 @@ def lower_semantic_to_native_tir(
     """Resolve S2 semantic leaves to S3 SW9A ABI-level operations."""
 
     verify_semantic_tir(mod, config)
+    kernel_kinds = {
+        str(func.attrs.get("sunway.kernel_kind", ""))
+        for func in mod.functions.values()
+        if isinstance(func, tirx.PrimFunc)
+    }
+    if kernel_kinds == {"gemm_scalar"}:
+        from .gemm_transform import lower_gemm_semantic_to_native_tir
 
-    def rewrite(func: tirx.PrimFunc) -> tirx.PrimFunc:
-        body = tirx.stmt_functor.ir_transform(func.body, None, _lower_semantic_call)
-        return func.with_body(body).with_attr("sunway.phase", "S3")
-
-    return _map_prim_funcs(mod, rewrite)
+        return lower_gemm_semantic_to_native_tir(mod, config)
+    if kernel_kinds != {"copy"}:
+        raise ValueError(f"Sunway S3 lowering does not support kernel kinds {sorted(kernel_kinds)!r}")
+    return _lower_semantic_calls_to_native(mod)
 
 
 def verify_native_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
@@ -345,6 +359,14 @@ def verify_native_tir(mod: IRModule, config: SunwayTargetConfig) -> IRModule:
         phase = "S3"
         if str(func.attrs.get("sunway.phase", "")) != phase:
             raise ValueError("Sunway S3 verifier received a function from another phase")
+        kernel_kind = str(func.attrs.get("sunway.kernel_kind", ""))
+        if kernel_kind == "gemm_scalar":
+            from .gemm_transform import _verify_gemm_native_func
+
+            return _verify_gemm_native_func(func, config)
+        if kernel_kind != "copy":
+            raise ValueError(f"Sunway S3 verifier does not support kernel kind {kernel_kind!r}")
+
         names = set(_named_calls(func))
         semantic = sorted(names & _SEMANTIC_CALLS)
         if semantic:
