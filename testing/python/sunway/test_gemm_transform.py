@@ -362,6 +362,13 @@ def test_g1_s3_preserves_mesh_ownership_and_native_dma() -> None:
     assert names["tilelang_sunway_pe_id"] == 0
 
 
+def test_g1_rejects_simd_until_the_compute_lowering_is_installed() -> None:
+    config = SunwayTargetConfig(gemm_ownership="mesh_2d", gemm_compute="simd")
+
+    with pytest.raises(ValueError, match="SIMD compute lowering is not installed"):
+        _lower(make_gemm_128_k64, config)
+
+
 def test_s3_verifier_rejects_a_residual_semantic_call() -> None:
     s3 = _lower_s3()
     invalid = _replace_first_extern(s3, "athread_get", "tilelang_sunway_dma_get")

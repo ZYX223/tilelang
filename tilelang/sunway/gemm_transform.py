@@ -426,6 +426,8 @@ def lower_gemm_program_to_semantic_tir(mod: IRModule, config: SunwayTargetConfig
 
     source_func = _only_prim_func(mod)
     plan = SunwayGemmPlan.from_prim_func(source_func, config)
+    if plan.compute == "simd":
+        raise ValueError("Sunway G1 SIMD compute lowering is not installed")
     block_tiles = _bound_block_tile_extents(source_func)
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)

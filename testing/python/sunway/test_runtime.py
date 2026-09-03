@@ -219,6 +219,27 @@ def test_generic_aot_scripts_do_not_name_a_kernel() -> None:
         assert name not in run_source
 
 
+def test_distributed_multik_gemm_example_keeps_official_frontend_and_reference() -> None:
+    example_dir = Path(__file__).parents[3] / "examples" / "sunway"
+    generator = (example_dir / "gemm_128_k64.py").read_text(encoding="utf-8")
+    main = (example_dir / "gemm_128_k64_main.c").read_text(encoding="utf-8")
+
+    assert "with T.Kernel(8, 8, threads=64)" in generator
+    assert "for ko in T.Pipelined(2, num_stages=1)" in generator
+    assert generator.count("T.copy(") == 3
+    assert generator.count("T.gemm(") == 1
+    assert '"gemm_ownership": "mesh_2d"' in generator
+    assert 'choices=("scalar", "simd")' in generator
+    assert 'target["gemm_compute"] = args.compute' in generator
+
+    assert main.count("athread_init();") == 1
+    assert "void gemm_128_k64(float *A, float *B, float *C);" in main
+    assert "for (int m = 0; m < M; ++m)" in main
+    assert "for (int n = 0; n < N; ++n)" in main
+    assert "for (int k = 0; k < K; ++k)" in main
+    assert "gemm_128_k64 passed: M=128 N=128 K=64" in main
+
+
 def test_library_generator_cross_compiles_boxed_torch_registration(tmp_path: Path) -> None:
     project_dir = tmp_path / "project"
     package_dir = tmp_path / "package"
